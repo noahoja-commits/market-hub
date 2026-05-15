@@ -115,18 +115,21 @@ def melt_zillow(df: pd.DataFrame, counties: list[str], state: str, kind: str) ->
 
 
 def fetch_fred_series(series_id: str) -> pd.DataFrame:
-    """Fetch one FRED CSV series with retries (FRED is flaky)."""
+    """Fetch one FRED CSV series with bounded retries.
+
+    Max budget per series ~75s (2 attempts × 30s + 15s sleep) so a single
+    flaky series can't blow up a multi-market build."""
     url = FRED_TMPL.format(series_id=series_id)
     last_err: Exception | None = None
-    for attempt in range(4):
+    for attempt in range(2):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=60)
+            r = requests.get(url, headers=HEADERS, timeout=30)
             r.raise_for_status()
             break
         except Exception as e:
             last_err = e
-            if attempt < 3:
-                time.sleep(3 * (attempt + 1))
+            if attempt < 1:
+                time.sleep(15)
                 continue
             raise
     from io import StringIO
