@@ -396,6 +396,15 @@ with st.sidebar:
     if st.button("Force live re-fetch", width="stretch"):
         st.cache_data.clear()
         st.rerun()
+    st.divider()
+    with st.expander("Share this view", expanded=False):
+        qp_str = "&".join(f"{k}={v}" for k, v in st.query_params.items())
+        st.caption("URL parameters encoding this exact view:")
+        st.code(f"?{qp_str}", language="text")
+        st.caption(
+            "Append to the app URL to share or bookmark the current "
+            "market + Deal Lens inputs."
+        )
     st.caption(
         "**Sources:** Zillow Research (ZHVI, ZORI), FRED (Federal Reserve), "
         "plus local realtor/PM blogs (see Commentary section)."
