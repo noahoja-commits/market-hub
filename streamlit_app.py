@@ -384,6 +384,9 @@ with status:
     hpi = fetch_fred(hpi_id, market.slug) if hpi_id else _empty_series()
     unemp = fetch_fred(unemp_id, market.slug) if unemp_id else _empty_series()
     st.write(f"  [HPI {len(hpi)}, unemployment {len(unemp)}]")
+    fl_permits = fetch_fred("FLBPPRIV", market.slug)
+    fl_hpi = fetch_fred("FLSTHPI", market.slug)
+    st.write(f"  [FL permits {len(fl_permits)}, FL HPI {len(fl_hpi)}]")
 status.update(label=f"{market.label} data loaded.", state="complete", expanded=False)
 
 zhvi_latest = latest_per_county(zhvi).set_index("RegionName")
@@ -597,6 +600,60 @@ with right:
         )
     else:
         st.info("Mortgage series unavailable.")
+
+# ──────────────────────────────────────────────────────────────────────
+# Florida statewide context — same data for every market
+# ──────────────────────────────────────────────────────────────────────
+
+st.subheader("Florida statewide context")
+st.caption(
+    "Macro signals that apply equally to every FL metro — useful as a "
+    "baseline to compare your selected market against."
+)
+fl_left, fl_right = st.columns(2)
+with fl_left:
+    last_permits = fl_permits["value"].iloc[-1] if not fl_permits.empty else None
+    permits_yoy = None
+    if len(fl_permits) >= 13:
+        permits_yoy = (
+            (fl_permits["value"].iloc[-1] - fl_permits["value"].iloc[-13])
+            / fl_permits["value"].iloc[-13]
+            * 100
+        )
+    st.markdown("**New housing permits — Florida**")
+    st.caption(
+        "FRED · FLBPPRIV · monthly · thousands of units"
+        + (f" · {fmt_pct(permits_yoy)} YoY" if permits_yoy is not None else "")
+    )
+    if not fl_permits.empty:
+        st.line_chart(
+            fl_permits.tail(60).set_index("date")[["value"]],
+            height=200,
+            color="#22c55e",
+        )
+    else:
+        st.info("Permits series unavailable.")
+with fl_right:
+    fl_hpi_yoy = None
+    if len(fl_hpi) >= 5:
+        fl_hpi_yoy = (
+            (fl_hpi["value"].iloc[-1] - fl_hpi["value"].iloc[-5])
+            / fl_hpi["value"].iloc[-5]
+            * 100
+        )
+    st.markdown("**FL House Price Index (state-wide)**")
+    st.caption(
+        "FRED · FLSTHPI · quarterly · FHFA all-transactions"
+        + (f" · {fmt_pct(fl_hpi_yoy)} YoY" if fl_hpi_yoy is not None else "")
+    )
+    if not fl_hpi.empty:
+        st.line_chart(
+            fl_hpi.tail(40).set_index("date")[["value"]],
+            height=200,
+            color="#a855f7",
+        )
+    else:
+        st.info("FL HPI series unavailable.")
 
 # ──────────────────────────────────────────────────────────────────────
 # Local commentary

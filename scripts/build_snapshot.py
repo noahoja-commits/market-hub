@@ -47,8 +47,13 @@ ZORI_URL = (
 )
 FRED_TMPL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
 
-# Mortgage rate is global, shared by every market
-GLOBAL_FRED_SERIES = ["MORTGAGE30US"]
+# FRED series that apply equally to every FL market — saved in every
+# market's parquet so the app can pull them with the same code path.
+GLOBAL_FRED_SERIES = [
+    "MORTGAGE30US",  # 30-yr fixed mortgage rate, US, weekly
+    "FLBPPRIV",      # FL new privately-owned housing units authorized, monthly
+    "FLSTHPI",       # FL all-transactions House Price Index (FHFA), quarterly
+]
 
 COMMENTARY_SOURCES = [
     {"name": "iBuyer — Tampa Investor Market Report", "url": "https://ibuyer.com/blog/tampa-investor-market-report/"},
