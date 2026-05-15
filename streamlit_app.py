@@ -563,7 +563,17 @@ with st.container(border=True):
         )
 
 st.subheader("By county")
-st.caption("Gross cap rate uses Zillow ZORI median rent ÷ ZHVI median value, annualized.")
+st.caption("Gross cap rate uses Zillow ZORI median rent ÷ ZHVI median value, annualized. Best cap rate in this metro gets a ⭐.")
+county_cap_rates: dict[str, float] = {}
+for c in market.counties:
+    v_ = zhvi_latest["value"].get(c)
+    r_ = zori_latest["value"].get(c)
+    if v_ and r_:
+        cr_ = cap_rate(v_, r_)
+        if cr_:
+            county_cap_rates[c] = cr_.gross
+best_county = max(county_cap_rates.items(), key=lambda kv: kv[1])[0] if county_cap_rates else None
+
 cols = st.columns(len(market.counties))
 for col, county in zip(cols, market.counties):
     short = county.replace(" County", "")
@@ -572,9 +582,10 @@ for col, county in zip(cols, market.counties):
     vy = zhvi_yoy.get(county)
     ry = zori_yoy.get(county)
     county_cr = cap_rate(v, r) if (v and r) else None
+    is_best = (county == best_county)
     with col:
         with st.container(border=True):
-            st.markdown(f"**{short}**")
+            st.markdown(f"**{short}**{' ⭐' if is_best else ''}")
             sub = st.columns(2)
             sub[0].metric(
                 "Value",
