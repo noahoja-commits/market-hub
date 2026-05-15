@@ -528,6 +528,7 @@ with st.container(border=True):
         )
 
 st.subheader("By county")
+st.caption("Gross cap rate uses Zillow ZORI median rent ÷ ZHVI median value, annualized.")
 cols = st.columns(len(market.counties))
 for col, county in zip(cols, market.counties):
     short = county.replace(" County", "")
@@ -535,26 +536,33 @@ for col, county in zip(cols, market.counties):
     r = zori_latest["value"].get(county)
     vy = zhvi_yoy.get(county)
     ry = zori_yoy.get(county)
+    county_cr = cap_rate(v, r) if (v and r) else None
     with col:
-        st.markdown(f"**{short}**")
-        sub = st.columns(2)
-        sub[0].metric(
-            "Value",
-            fmt_money(v, compact=True),
-            f"{fmt_pct(vy)} YoY" if vy is not None else None,
-        )
-        sub[1].metric(
-            "Rent",
-            fmt_money(r),
-            f"{fmt_pct(ry)} YoY" if ry is not None else None,
-        )
-        spark = zhvi[zhvi["RegionName"] == county].tail(60)[["date", "value"]]
-        if not spark.empty:
-            st.line_chart(
-                spark.set_index("date"),
-                height=120,
-                color="#0ea5e9",
+        with st.container(border=True):
+            st.markdown(f"**{short}**")
+            sub = st.columns(2)
+            sub[0].metric(
+                "Value",
+                fmt_money(v, compact=True),
+                f"{fmt_pct(vy)} YoY" if vy is not None else None,
             )
+            sub[1].metric(
+                "Rent",
+                fmt_money(r),
+                f"{fmt_pct(ry)} YoY" if ry is not None else None,
+            )
+            if county_cr:
+                st.caption(
+                    f"**Gross cap:** {county_cr.gross:.2f}%  ·  "
+                    f"**Net (after 40% opex):** {county_cr.net:.2f}%"
+                )
+            spark = zhvi[zhvi["RegionName"] == county].tail(60)[["date", "value"]]
+            if not spark.empty:
+                st.line_chart(
+                    spark.set_index("date"),
+                    height=120,
+                    color="#0ea5e9",
+                )
 
 if hpi_id:
     st.subheader(f"{market.label} MSA — Home Price Index")
