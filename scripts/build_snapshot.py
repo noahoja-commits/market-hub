@@ -114,6 +114,28 @@ def melt_zillow(df: pd.DataFrame, counties: list[str], state: str, kind: str) ->
     return long.dropna(subset=["value"]).sort_values(["RegionName", "date"]).reset_index(drop=True)
 
 
+PMMS_URL = "https://www.freddiemac.com/pmms/docs/PMMS_history.csv"
+
+
+def fetch_pmms_mortgage() -> pd.DataFrame:
+    """Direct fetch of Freddie Mac's PMMS 30-yr fixed rate, weekly.
+
+    Bypasses FRED (which has been flaky). Saved with series="MORTGAGE30US"
+    so the existing app code finds it under the same key.
+    """
+    r = requests.get(PMMS_URL, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    from io import StringIO
+    df = pd.read_csv(StringIO(r.text))
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df["date"], errors="coerce"),
+        "value": pd.to_numeric(df["pmms30"], errors="coerce"),
+    })
+    out = out.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+    out["series"] = "MORTGAGE30US"
+    return out
+
+
 def fetch_fred_series(series_id: str) -> pd.DataFrame:
     """Fetch one FRED CSV series with bounded retries.
 
@@ -213,18 +235,38 @@ def build_zillow_all_markets() -> dict[str, bool]:
 
 
 def build_fred_all_markets() -> dict[str, bool]:
-    """For each market, fetch its FRED series + the global ones, write parquet."""
+    """For each market, write per-market parquet with whatever FRED data we got.
+
+    Mortgage rate comes from Freddie Mac PMMS (more reliable than FRED's
+    fredgraph.csv endpoint). The rest are best-effort FRED CSV calls.
+    """
     print("[fred] fetching series per market...", flush=True)
 
-    # Cache global series so we only fetch them once
     global_cache: dict[str, pd.DataFrame] = {}
+
+    # 1. Mortgage rate via PMMS (primary path)
+    try:
+        global_cache["MORTGAGE30US"] = fetch_pmms_mortgage()
+        print(f"  [ok] MORTGAGE30US via PMMS: {len(global_cache['MORTGAGE30US']):,} obs")
+    except Exception as e:
+        print(f"  [fail] PMMS mortgage: {e.__class__.__name__}: {e} — trying FRED", file=sys.stderr)
+        try:
+            global_cache["MORTGAGE30US"] = fetch_fred_series("MORTGAGE30US")
+            print(f"  [ok] MORTGAGE30US via FRED fallback: {len(global_cache['MORTGAGE30US']):,} obs")
+        except Exception as e2:
+            print(f"  [fail] MORTGAGE30US fallback: {e2.__class__.__name__}", file=sys.stderr)
+
+    # 2. Other global FRED series (FL state-level)
     for sid in GLOBAL_FRED_SERIES:
+        if sid == "MORTGAGE30US":
+            continue  # handled above via PMMS
         try:
             global_cache[sid] = fetch_fred_series(sid)
             print(f"  [ok] {sid} (global): {len(global_cache[sid]):,} obs")
         except Exception as e:
-            print(f"  [fail] {sid} (global): {e.__class__.__name__}: {e}", file=sys.stderr)
+            print(f"  [fail] {sid} (global): {e.__class__.__name__}", file=sys.stderr)
 
+    # 3. Per-market MSA series
     results: dict[str, bool] = {}
     for market in MARKETS:
         frames: list[pd.DataFrame] = list(global_cache.values())

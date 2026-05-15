@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-05-15T04:49:59.113861+00:00",
+  "fetched_at": "2026-05-15T05:01:41.557754+00:00",
   "sources": {
     "https://ibuyer.com/blog/tampa-investor-market-report/": {
       "ok": true,
@@ -8,8 +8,10 @@
       "latest": "Get Multiple Cash Offers in Minutes"
     },
     "https://www.3avesgroup.com/blog/": {
-      "ok": false,
-      "error": "HTTPError: 403 Client Error: Forbidden for url: https://www.3avesgroup.com/blog/"
+      "ok": true,
+      "title": "Tampa Bay Real Estate Blog - Tampa Bay Real Estate and Homes for Sale",
+      "desc": "News, tips and information on buying and selling real estate in Tampa Bay.",
+      "latest": "Tampa Bay Real Estate Blog"
     },
     "https://www.tampabayrealtorsean.com": {
       "ok": true,
@@ -24,8 +26,10 @@
       "latest": "Sell Your Tampa Bay Home with Liane Jamason"
     },
     "https://www.smithandassociates.com/tampa-bay-market-report/": {
-      "ok": false,
-      "error": "HTTPError: 403 Client Error: Forbidden for url: https://www.smithandassociates.com/tampa-bay-market-report/"
+      "ok": true,
+      "title": "Tampa Bay Market Report | Smith & Associates",
+      "desc": "If you\u2019re considering a move this year, it\u2019s more important than ever to work with an experienced agent who understands the dynamics of our local market. Please reach out if we can put our local expertise to work for you.",
+      "latest": "Tampa Bay Market Report March 2026"
     },
     "https://outfastpropertymanagement.com": {
       "ok": true,
