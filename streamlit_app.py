@@ -453,6 +453,39 @@ if len(mortgage) > 4:
 last_mortgage_date = mortgage["date"].iloc[-1].strftime("%b %d") if not mortgage.empty else ""
 zhvi_as_of = zhvi["date"].max().strftime("%b %Y") if not zhvi.empty else ""
 
+# Auto-generated 1-sentence "so what" for the selected market
+def _signal_text() -> str:
+    parts: list[str] = []
+    if rent_yield is not None:
+        if rent_yield >= 7:
+            parts.append(f"gross yield **{rent_yield:.1f}%** (healthy)")
+        elif rent_yield >= 5.5:
+            parts.append(f"gross yield **{rent_yield:.1f}%** (decent)")
+        else:
+            parts.append(f"gross yield **{rent_yield:.1f}%** (tight)")
+    if mortgage_4w_bps is not None:
+        if mortgage_4w_bps <= -10:
+            parts.append(f"rates ↓{abs(mortgage_4w_bps):.0f} bps in 4w (affordability improving)")
+        elif mortgage_4w_bps >= 10:
+            parts.append(f"rates ↑{mortgage_4w_bps:.0f} bps in 4w (affordability tightening)")
+        else:
+            parts.append(f"rates flat at **{last_mortgage:.2f}%**")
+    if metro_value_yoy is not None:
+        direction = "up" if metro_value_yoy > 0 else "down"
+        parts.append(f"values **{direction} {abs(metro_value_yoy):.1f}% YoY**")
+    return " · ".join(parts) if parts else ""
+
+
+signal = _signal_text()
+if signal:
+    st.markdown(
+        f"<div style='padding:0.75rem 1rem;background:#171717;border-left:3px solid #0ea5e9;"
+        f"border-radius:4px;font-size:0.92rem;margin-bottom:1.25rem'>"
+        f"<strong>{market.label} signal:</strong> {signal}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
 st.subheader("Metro snapshot")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric(
