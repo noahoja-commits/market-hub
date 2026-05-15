@@ -319,7 +319,18 @@ default_slug = st.query_params.get("market", "tampa-bay")
 if default_slug not in MARKETS_BY_SLUG:
     default_slug = "tampa-bay"
 
-st.title("FL Market Hub")
+title_col, fresh_col = st.columns([3, 2])
+with title_col:
+    st.title("FL Market Hub")
+with fresh_col:
+    fresh_quick = snapshot_freshness(default_slug)
+    quick_zillow = fresh_quick.get("Zillow", "live")
+    st.markdown(
+        f"<div style='text-align:right;padding-top:2rem;color:#71717a;font-size:0.85rem'>"
+        f"Snapshot refreshed: <strong>{quick_zillow}</strong>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 market_labels = [m.label for m in MARKETS]
 selected_label = st.segmented_control(
