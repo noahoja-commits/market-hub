@@ -1,3 +1,13 @@
+---
+title: FL Market Hub
+emoji: 📊
+colorFrom: blue
+colorTo: green
+sdk: streamlit
+app_file: streamlit_app.py
+pinned: false
+---
+
 # FL Market Hub
 
 Streamlit dashboard for Florida real estate market data across 5 metros
