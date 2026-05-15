@@ -394,7 +394,7 @@ with st.sidebar:
         "Refreshed weekly by the GitHub Action. Pages should load in <1s."
     )
     st.divider()
-    if st.button("Force live re-fetch", use_container_width=True):
+    if st.button("Force live re-fetch", width="stretch"):
         st.cache_data.clear()
         st.rerun()
     st.caption(
@@ -666,7 +666,7 @@ if summary_rows:
     })
     st.dataframe(
         display_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Cap rate (sortable)": st.column_config.ProgressColumn(
