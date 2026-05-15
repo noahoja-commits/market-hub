@@ -18,6 +18,8 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+from lib.deal_math import brrrr_refinance, cap_rate, mao_70, piti, price_to_rent
+
 DATA_DIR = Path(__file__).parent / "data"
 
 st.set_page_config(
@@ -412,6 +414,96 @@ c4.metric(
     delta_color="inverse",
     help=f"FRED MORTGAGE30US · week of {last_mortgage_date}",
 )
+
+st.subheader("Deal lens")
+st.caption(
+    "Plug in a hypothetical deal — county median rent + current mortgage rate "
+    "auto-fill from the snapshot above. All math is gross-of-fees rules of thumb."
+)
+with st.container(border=True):
+    in_col, out_col = st.columns([1, 1.4])
+    with in_col:
+        county_short_to_full = {c.replace(" County", ""): c for c in TAMPA_COUNTIES}
+        sel_short = st.selectbox(
+            "County",
+            list(county_short_to_full.keys()),
+            index=0,
+        )
+        sel_county = county_short_to_full[sel_short]
+        deal_price = st.number_input(
+            "Purchase price ($)",
+            min_value=10_000, max_value=5_000_000,
+            value=int(zhvi_latest["value"].get(sel_county) or 350_000),
+            step=5_000,
+        )
+        deal_repair = st.number_input(
+            "Estimated repair cost ($)",
+            min_value=0, max_value=1_000_000,
+            value=25_000, step=5_000,
+        )
+        deal_arv = st.number_input(
+            "ARV — after-repair value ($)",
+            min_value=10_000, max_value=5_000_000,
+            value=int(deal_price * 1.20),
+            step=5_000,
+        )
+        deal_down = st.slider("Down payment (%)", 0, 100, 20, step=5) / 100
+        deal_rate = st.slider(
+            "Mortgage rate (%)",
+            min_value=3.0, max_value=12.0,
+            value=float(last_mortgage) if last_mortgage is not None else 6.81,
+            step=0.05,
+        )
+    with out_col:
+        county_rent = zori_latest["value"].get(sel_county)
+        cr = cap_rate(deal_price, county_rent) if county_rent else None
+        pr = price_to_rent(deal_price, county_rent) if county_rent else None
+        monthly_piti = piti(deal_price, deal_down, deal_rate)
+        mao = mao_70(deal_arv, deal_repair)
+        brrrr = brrrr_refinance(deal_price, deal_repair, deal_arv)
+
+        st.markdown(f"**Auto-filled:** median rent in {sel_short} = **{fmt_money(county_rent)}/mo** · "
+                    f"current 30-yr rate = **{deal_rate:.2f}%**")
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric(
+            "Gross cap rate",
+            f"{cr.gross:.2f}%" if cr else "—",
+            f"Net (after 40% opex): {cr.net:.2f}%" if cr else None,
+        )
+        m2.metric(
+            "Price-to-rent",
+            f"{pr:.1f}x" if pr else "—",
+            help="<15 cheap · 15–20 fair · >20 expensive (rough rule of thumb)",
+        )
+        cashflow = (county_rent or 0) - (monthly_piti or 0)
+        m3.metric(
+            "Monthly cashflow",
+            fmt_money(cashflow),
+            f"Rent {fmt_money(county_rent)} − PITI {fmt_money(monthly_piti)}",
+            delta_color="off" if cashflow == 0 else ("normal" if cashflow > 0 else "inverse"),
+        )
+
+        st.divider()
+        m4, m5, m6 = st.columns(3)
+        m4.metric(
+            "MAO (70% rule)",
+            fmt_money(mao),
+            f"vs ask {fmt_money(deal_price)}",
+            delta_color=("normal" if mao and deal_price <= mao else "inverse"),
+            help="Max allowable offer = ARV × 70% − repair. Negative = ARV too low / repair too high.",
+        )
+        m5.metric(
+            "BRRRR refi loan",
+            fmt_money(brrrr.refi_loan) if brrrr else "—",
+            f"75% LTV of ARV {fmt_money(deal_arv)}" if brrrr else None,
+        )
+        m6.metric(
+            "Left in after refi",
+            fmt_money(brrrr.left_in) if brrrr else "—",
+            "negative = cash-out exceeds basis" if brrrr and brrrr.left_in < 0 else None,
+            delta_color=("inverse" if brrrr and brrrr.left_in > 0 else "normal"),
+        )
 
 st.subheader("By county")
 cols = st.columns(len(TAMPA_COUNTIES))
