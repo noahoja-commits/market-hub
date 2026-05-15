@@ -349,23 +349,10 @@ def fmt_pct(n: float | None, sign: bool = True) -> str:
 # UI
 # ──────────────────────────────────────────────────────────────────────
 
-# ── Market selector at top ────────────────────────────────────────────
+# ── Market selector + header ──────────────────────────────────────────
 default_slug = st.query_params.get("market", "tampa-bay")
 if default_slug not in MARKETS_BY_SLUG:
     default_slug = "tampa-bay"
-
-title_col, fresh_col = st.columns([3, 2])
-with title_col:
-    st.title("FL Market Hub")
-with fresh_col:
-    fresh_quick = snapshot_freshness(default_slug)
-    quick_zillow = fresh_quick.get("Zillow", "live")
-    st.markdown(
-        f"<div style='text-align:right;padding-top:2rem;color:#71717a;font-size:0.85rem'>"
-        f"Snapshot refreshed: <strong>{quick_zillow}</strong>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
 
 market_labels = [m.label for m in MARKETS]
 selected_label = st.segmented_control(
@@ -379,7 +366,19 @@ if selected_label is None:
 market: Market = next(m for m in MARKETS if m.label == selected_label)
 st.query_params["market"] = market.slug
 
-st.caption(" · ".join(c.replace(" County", "") for c in market.counties))
+title_col, fresh_col = st.columns([3, 2])
+with title_col:
+    st.title("FL Market Hub")
+    st.caption(" · ".join(c.replace(" County", "") for c in market.counties))
+with fresh_col:
+    fresh_quick = snapshot_freshness(market.slug)
+    quick_zillow = fresh_quick.get("Zillow", "live")
+    st.markdown(
+        f"<div style='text-align:right;padding-top:1rem;color:#71717a;font-size:0.85rem'>"
+        f"Snapshot refreshed: <strong>{quick_zillow}</strong>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 with st.sidebar:
     st.header("Snapshot status")
