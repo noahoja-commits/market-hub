@@ -40,14 +40,25 @@ from lib.sources import bls, census_bps, fred_api  # noqa: E402
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-ZHVI_URL = (
-    "https://files.zillowstatic.com/research/public_csvs/zhvi/"
-    "County_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv"
-)
-ZORI_URL = (
-    "https://files.zillowstatic.com/research/public_csvs/zori/"
-    "County_zori_uc_sfrcondomfr_sm_month.csv"
-)
+_ZBASE = "https://files.zillowstatic.com/research/public_csvs"
+
+# County-level Zillow series: (url, kind). All share the ZHVI column layout.
+ZILLOW_COUNTY_CSVS: list[tuple[str, str]] = [
+    (f"{_ZBASE}/zhvi/County_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv", "zhvi"),
+    (f"{_ZBASE}/zori/County_zori_uc_sfrcondomfr_sm_month.csv", "zori"),
+    (f"{_ZBASE}/invt_fs/County_invt_fs_uc_sfrcondo_sm_month.csv", "invt_fs"),
+    (f"{_ZBASE}/mean_doz_pending/County_mean_doz_pending_uc_sfrcondo_sm_month.csv", "days_pending"),
+    (f"{_ZBASE}/new_listings/County_new_listings_uc_sfrcondo_sm_month.csv", "new_listings"),
+    (f"{_ZBASE}/median_sale_price/County_median_sale_price_uc_sfrcondo_sm_sa_month.csv", "sale_price"),
+    (f"{_ZBASE}/mean_sale_to_list/County_mean_sale_to_list_uc_sfrcondo_sm_month.csv", "sale_to_list"),
+]
+
+# ZIP-level series for sub-county drill-down.
+ZILLOW_ZIP_CSVS: list[tuple[str, str]] = [
+    (f"{_ZBASE}/zhvi/Zip_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv", "zhvi"),
+    (f"{_ZBASE}/zori/Zip_zori_uc_sfrcondomfr_sm_month.csv", "zori"),
+]
+
 PMMS_URL = "https://www.freddiemac.com/pmms/docs/PMMS_history.csv"
 
 COMMENTARY_SOURCES = [
@@ -111,16 +122,35 @@ def melt_zillow(df: pd.DataFrame, counties: list[str], state: str, kind: str) ->
     return long.dropna(subset=["value"]).sort_values(["RegionName", "date"]).reset_index(drop=True)
 
 
+def melt_zillow_zip(df: pd.DataFrame, counties: list[str], state: str, kind: str) -> pd.DataFrame:
+    """Melt a ZIP-level Zillow CSV, filtered to a market's counties.
+    ZIP files carry RegionName (=ZIP) + CountyName."""
+    df = df[(df["StateName"] == state) & (df["CountyName"].isin(counties))]
+    date_cols = [c for c in df.columns if DATE_RE.match(str(c))]
+    long = df.melt(
+        id_vars=["RegionName", "CountyName"],
+        value_vars=date_cols,
+        var_name="date",
+        value_name="value",
+    )
+    long = long.rename(columns={"RegionName": "zip", "CountyName": "county"})
+    long["date"] = pd.to_datetime(long["date"])
+    long["value"] = pd.to_numeric(long["value"], errors="coerce")
+    long["kind"] = kind
+    return long.dropna(subset=["value"]).sort_values(["zip", "date"]).reset_index(drop=True)
+
+
 def build_zillow_all_markets() -> dict[str, bool]:
-    print("[zillow] downloading ZHVI + ZORI CSVs (once for all markets)...", flush=True)
+    print(f"[zillow] downloading {len(ZILLOW_COUNTY_CSVS)} county CSVs "
+          "(once for all markets)...", flush=True)
     raw: dict[str, pd.DataFrame] = {}
-    for url, kind in [(ZHVI_URL, "zhvi"), (ZORI_URL, "zori")]:
+    for url, kind in ZILLOW_COUNTY_CSVS:
         try:
             raw[kind] = load_zillow_csv(url)
             print(f"  [ok] {kind}: {len(raw[kind]):,} total county-rows")
         except Exception as e:
             print(f"  [fail] {kind}: {e.__class__.__name__}: {e}", file=sys.stderr)
-    if not raw:
+    if "zhvi" not in raw:
         return {m.slug: False for m in MARKETS}
     results: dict[str, bool] = {}
     for market in MARKETS:
@@ -130,7 +160,37 @@ def build_zillow_all_markets() -> dict[str, bool]:
             path = DATA_DIR / f"{market.slug}-zillow.parquet"
             combined.to_parquet(path, index=False, compression="zstd")
             print(f"  [ok] {market.slug}: {len(combined):,} rows × "
-                  f"{combined['RegionName'].nunique()} counties → {path.name}")
+                  f"{combined['kind'].nunique()} series → {path.name}")
+            results[market.slug] = True
+        except Exception as e:
+            print(f"  [fail] {market.slug}: {e.__class__.__name__}: {e}", file=sys.stderr)
+            results[market.slug] = False
+    return results
+
+
+def build_zips() -> dict[str, bool]:
+    """Download ZIP-level ZHVI + ZORI, filter per market, write
+    data/<slug>-zips.parquet (columns: zip, county, kind, date, value)."""
+    print("[zips] downloading ZIP-level ZHVI + ZORI...", flush=True)
+    raw: dict[str, pd.DataFrame] = {}
+    for url, kind in ZILLOW_ZIP_CSVS:
+        try:
+            raw[kind] = load_zillow_csv(url)
+            print(f"  [ok] zip {kind}: {len(raw[kind]):,} total ZIP-rows")
+        except Exception as e:
+            print(f"  [fail] zip {kind}: {e.__class__.__name__}: {e}", file=sys.stderr)
+    if not raw:
+        return {m.slug: False for m in MARKETS}
+    results: dict[str, bool] = {}
+    for market in MARKETS:
+        try:
+            frames = [melt_zillow_zip(w, market.counties, market.state, k)
+                      for k, w in raw.items()]
+            combined = pd.concat(frames, ignore_index=True)
+            path = DATA_DIR / f"{market.slug}-zips.parquet"
+            combined.to_parquet(path, index=False, compression="zstd")
+            print(f"  [ok] {market.slug}: {len(combined):,} rows × "
+                  f"{combined['zip'].nunique()} ZIPs → {path.name}")
             results[market.slug] = True
         except Exception as e:
             print(f"  [fail] {market.slug}: {e.__class__.__name__}: {e}", file=sys.stderr)
@@ -243,11 +303,30 @@ def build_indicators_all_markets() -> dict[str, bool]:
         except Exception as e:
             print(f"  [fail] {market.slug}/permits: {e.__class__.__name__}", file=sys.stderr)
 
+        # Carry-forward: for any expected series that failed to fetch this
+        # run (e.g. BLS rate-limited), keep the prior data from the existing
+        # parquet so a transient failure never blanks a chart.
+        path = DATA_DIR / f"{market.slug}-indicators.parquet"
+        fresh_series = {s for f in frames for s in f["series"].unique()}
+        expected = {"mortgage_30yr", "treasury_10yr", "fed_funds",
+                    "unemployment", "employment", "permits"}
+        missing = expected - fresh_series
+        if missing and path.exists():
+            try:
+                prior = pd.read_parquet(path)
+                carried = prior[prior["series"].isin(missing)]
+                if not carried.empty:
+                    frames.append(carried)
+                    print(f"  [carry] {market.slug}: kept prior "
+                          f"{sorted(carried['series'].unique())}")
+            except Exception as e:
+                print(f"  [warn] {market.slug} carry-forward: {e.__class__.__name__}",
+                      file=sys.stderr)
+
         if not frames:
             results[market.slug] = False
             continue
         combined = pd.concat(frames, ignore_index=True)
-        path = DATA_DIR / f"{market.slug}-indicators.parquet"
         combined.to_parquet(path, index=False, compression="zstd")
         print(f"  [ok] {market.slug}: {len(combined):,} rows → {path.name}")
         results[market.slug] = True
@@ -314,11 +393,14 @@ def main() -> int:
     started = time.time()
     print(f"Building snapshot for {len(MARKETS)} markets in {DATA_DIR}")
     zillow = build_zillow_all_markets()
+    zips = build_zips()
     indicators = build_indicators_all_markets()
     commentary_ok = build_commentary()
     elapsed = time.time() - started
-    total_ok = sum(zillow.values()) + sum(indicators.values()) + (1 if commentary_ok else 0)
+    total_ok = (sum(zillow.values()) + sum(zips.values())
+                + sum(indicators.values()) + (1 if commentary_ok else 0))
     print(f"\nDone — Zillow {sum(zillow.values())}/{len(MARKETS)}, "
+          f"ZIPs {sum(zips.values())}/{len(MARKETS)}, "
           f"Indicators {sum(indicators.values())}/{len(MARKETS)}, "
           f"Commentary {'ok' if commentary_ok else 'fail'}. "
           f"Elapsed: {elapsed:.1f}s")

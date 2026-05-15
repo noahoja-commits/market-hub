@@ -24,6 +24,7 @@ from bs4 import BeautifulSoup
 
 from lib.brief import MarketSnapshot, generate_brief
 from lib.deal_math import brrrr_refinance, cap_rate, mao_70, piti, price_to_rent
+from lib.market_temp import market_temperature
 from lib.markets import MARKETS, MARKETS_BY_SLUG, Market
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -253,6 +254,46 @@ def fmt_pct(n: float | None, sign: bool = True) -> str:
     return f"{'+' if sign and n > 0 else ''}{n:.1f}%"
 
 
+@st.cache_data(ttl=WEEK, show_spinner=False)
+def load_zillow_kind(market_slug: str, kind: str) -> pd.DataFrame:
+    """Read one Zillow series kind from the snapshot (zhvi/zori/invt_fs/
+    days_pending/new_listings/sale_price/sale_to_list)."""
+    snap = _zillow_from_snapshot(market_slug, kind)
+    return snap if snap is not None else _empty_long()
+
+
+@st.cache_data(ttl=WEEK, show_spinner=False)
+def load_zips(market_slug: str) -> pd.DataFrame:
+    """Read ZIP-level ZHVI/ZORI snapshot. Columns: zip, county, kind, date, value."""
+    path = DATA_DIR / f"{market_slug}-zips.parquet"
+    if not path.exists():
+        return pd.DataFrame({"zip": [], "county": [], "kind": [], "date": [], "value": []})
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return pd.DataFrame({"zip": [], "county": [], "kind": [], "date": [], "value": []})
+
+
+def metro_series(long: pd.DataFrame, agg: str = "mean") -> pd.DataFrame:
+    """Collapse a per-county long frame to one metro-level date/value series."""
+    if long.empty:
+        return _empty_series()
+    g = long.groupby("date", as_index=False)["value"]
+    out = g.sum() if agg == "sum" else g.mean()
+    return out.sort_values("date").reset_index(drop=True)
+
+
+def latest_and_yoy(series: pd.DataFrame) -> tuple[float | None, float | None]:
+    """Latest value + YoY % change (12 months back) of a date/value series."""
+    if series.empty:
+        return None, None
+    latest = float(series["value"].iloc[-1])
+    if len(series) >= 13 and series["value"].iloc[-13]:
+        yoy = (latest - series["value"].iloc[-13]) / series["value"].iloc[-13] * 100
+        return latest, yoy
+    return latest, None
+
+
 def load_market_summary(m: Market) -> dict | None:
     zhvi_df = _zillow_from_snapshot(m.slug, "zhvi")
     zori_df = _zillow_from_snapshot(m.slug, "zori")
@@ -278,6 +319,13 @@ def load_market_summary(m: Market) -> dict | None:
         row["rent"] = None
     row["cap_rate"] = ((row["rent"] * 12 / row["value"]) * 100
                        if row.get("value") and row.get("rent") else None)
+    # Market pace — days-to-pending + sale-to-list (metro averages)
+    dp = _zillow_from_snapshot(m.slug, "days_pending")
+    row["days_pending"] = (float(metro_series(dp)["value"].iloc[-1])
+                           if dp is not None and not dp.empty else None)
+    stl = _zillow_from_snapshot(m.slug, "sale_to_list")
+    row["sale_to_list"] = (float(metro_series(stl)["value"].iloc[-1])
+                           if stl is not None and not stl.empty else None)
     return row
 
 
@@ -340,6 +388,27 @@ permits_metro = permits_by_year(indicators)
 treasury10 = indicator_series(indicators, "treasury_10yr")
 fed_funds = indicator_series(indicators, "fed_funds")
 
+# Zillow market-pace series (per-county long frames)
+inventory_c = load_zillow_kind(market.slug, "invt_fs")
+days_pending_c = load_zillow_kind(market.slug, "days_pending")
+new_listings_c = load_zillow_kind(market.slug, "new_listings")
+sale_price_c = load_zillow_kind(market.slug, "sale_price")
+sale_to_list_c = load_zillow_kind(market.slug, "sale_to_list")
+zips_df = load_zips(market.slug)
+
+# Metro-level pace series
+inventory_m = metro_series(inventory_c, agg="sum")
+days_pending_m = metro_series(days_pending_c, agg="mean")
+new_listings_m = metro_series(new_listings_c, agg="sum")
+sale_price_m = metro_series(sale_price_c, agg="mean")
+sale_to_list_m = metro_series(sale_to_list_c, agg="mean")
+inv_now, inv_yoy = latest_and_yoy(inventory_m)
+dp_now, dp_yoy = latest_and_yoy(days_pending_m)
+stl_now, _ = latest_and_yoy(sale_to_list_m)
+dp_yr_ago = days_pending_m["value"].iloc[-13] if len(days_pending_m) >= 13 else None
+inv_yr_ago = inventory_m["value"].iloc[-13] if len(inventory_m) >= 13 else None
+stl_yr_ago = sale_to_list_m["value"].iloc[-13] if len(sale_to_list_m) >= 13 else None
+
 zhvi_latest = latest_per_county(zhvi).set_index("RegionName")
 zori_latest = latest_per_county(zori).set_index("RegionName")
 zhvi_yoy = yoy_per_county(zhvi)
@@ -391,6 +460,9 @@ brief = generate_brief(MarketSnapshot(
     unemployment=last_unemp, unemployment_yr_ago=unemp_yr_ago,
     permits_latest=permits_latest, permits_prior=permits_prior,
     permits_latest_year=int(permits_metro["date"].max().year) if not permits_metro.empty else None,
+    days_pending=dp_now, days_pending_yr_ago=dp_yr_ago,
+    inventory=inv_now, inventory_yr_ago=inv_yr_ago,
+    sale_to_list=stl_now, sale_to_list_yr_ago=stl_yr_ago,
     county_caps=county_caps, county_values=county_values,
 ))
 
@@ -516,13 +588,18 @@ with st.container(border=True):
 # ── By county ──────────────────────────────────────────────────────────
 st.subheader("By county")
 st.caption(f"Gross cap = ZORI rent ÷ ZHVI value, annualized. Data as of {zhvi_as_of}. "
-           f"Best cap rate in this metro gets a ⭐.")
+           f"DOM = median days-to-pending. Best cap rate gets a ⭐.")
+_dp_county = (latest_per_county(days_pending_c).set_index("RegionName")["value"]
+              if not days_pending_c.empty else pd.Series(dtype=float))
+_inv_county = (latest_per_county(inventory_c).set_index("RegionName")["value"]
+               if not inventory_c.empty else pd.Series(dtype=float))
 cols = st.columns(len(market.counties))
 for col, county in zip(cols, market.counties):
     short = county.replace(" County", "")
     v, r = zhvi_latest["value"].get(county), zori_latest["value"].get(county)
     vy, ry = zhvi_yoy.get(county), zori_yoy.get(county)
     county_cr = cap_rate(v, r) if (v and r) else None
+    dp_v, inv_v = _dp_county.get(county), _inv_county.get(county)
     with col:
         with st.container(border=True):
             st.markdown(f"**{short}**{' ⭐' if short == best_county else ''}")
@@ -534,9 +611,136 @@ for col, county in zip(cols, market.counties):
             if county_cr:
                 st.caption(f"**Gross cap:** {county_cr.gross:.2f}% · "
                            f"**Net:** {county_cr.net:.2f}%")
+            pace_bits = []
+            if dp_v is not None and pd.notna(dp_v):
+                pace_bits.append(f"DOM {dp_v:.0f}d")
+            if inv_v is not None and pd.notna(inv_v):
+                pace_bits.append(f"{inv_v:,.0f} for sale")
+            if pace_bits:
+                st.caption(" · ".join(pace_bits))
             spark = zhvi[zhvi["RegionName"] == county].tail(60)[["date", "value"]]
             if not spark.empty:
                 st.line_chart(spark.set_index("date"), height=120, color="#0ea5e9")
+
+# ── Market pace ────────────────────────────────────────────────────────
+st.subheader("Market pace — buyer's vs seller's market")
+temp = market_temperature(
+    dp_now, dp_yr_ago, inv_now, inv_yr_ago, stl_now, stl_yr_ago,
+)
+# Temperature gauge: position 0..100 from score −100..+100
+gauge_pos = (temp.score + 100) / 2
+gauge_color = ("#22c55e" if temp.score < -15 else
+               "#ef4444" if temp.score > 15 else "#f59e0b")
+st.markdown(
+    f"<div style='padding:1rem;background:#171717;border-radius:6px;margin-bottom:0.5rem'>"
+    f"<div style='font-size:1.15rem;font-weight:600;color:{gauge_color}'>"
+    f"{temp.label} <span style='color:#71717a;font-weight:400;font-size:0.9rem'>"
+    f"(score {temp.score:+.0f})</span></div>"
+    f"<div style='margin:0.6rem 0;height:10px;border-radius:5px;"
+    f"background:linear-gradient(90deg,#22c55e,#f59e0b,#ef4444)'>"
+    f"<div style='width:2px;height:16px;background:#fff;margin-top:-3px;"
+    f"margin-left:calc({gauge_pos:.0f}% - 1px)'></div></div>"
+    f"<div style='display:flex;justify-content:space-between;font-size:0.75rem;"
+    f"color:#71717a'><span>buyer's market</span><span>balanced</span>"
+    f"<span>seller's market</span></div></div>",
+    unsafe_allow_html=True,
+)
+for reason in temp.reasons:
+    st.markdown(f"- {reason}")
+st.caption("Composite of days-to-pending, for-sale inventory, and sale-to-list "
+           "ratio — each scored against its own 12-month-ago level. "
+           "Source: Zillow Research.")
+
+p1, p2, p3 = st.columns(3)
+with p1:
+    st.markdown("**For-sale inventory**")
+    st.caption(f"Zillow · monthly · {inv_now:,.0f} homes"
+               + (f" · {fmt_pct(inv_yoy)} YoY" if inv_yoy is not None else "")
+               if inv_now is not None else "Zillow · monthly")
+    if not inventory_m.empty:
+        st.line_chart(inventory_m.tail(72).set_index("date")[["value"]],
+                      height=200, color="#0ea5e9")
+    else:
+        st.info("No inventory data.")
+with p2:
+    st.markdown("**Days to pending**")
+    st.caption(f"Zillow · monthly · {dp_now:.0f} days"
+               + (f" · {fmt_pct(dp_yoy)} YoY" if dp_yoy is not None else "")
+               if dp_now is not None else "Zillow · monthly")
+    if not days_pending_m.empty:
+        st.line_chart(days_pending_m.tail(72).set_index("date")[["value"]],
+                      height=200, color="#f59e0b")
+    else:
+        st.info("No days-to-pending data.")
+with p3:
+    st.markdown("**Sale-to-list ratio**")
+    st.caption(f"Zillow · monthly · {stl_now * 100:.1f}% of list"
+               if stl_now is not None else "Zillow · monthly")
+    if not sale_to_list_m.empty:
+        stl_chart = sale_to_list_m.tail(72).copy()
+        stl_chart["value"] = stl_chart["value"] * 100
+        st.line_chart(stl_chart.set_index("date")[["value"]],
+                      height=200, color="#a855f7")
+    else:
+        st.info("No sale-to-list data.")
+
+p4, p5 = st.columns(2)
+with p4:
+    st.markdown("**New listings** — monthly supply flow")
+    nl_now, nl_yoy = latest_and_yoy(new_listings_m)
+    st.caption(f"Zillow · monthly · {nl_now:,.0f} new listings"
+               + (f" · {fmt_pct(nl_yoy)} YoY" if nl_yoy is not None else "")
+               if nl_now is not None else "Zillow · monthly")
+    if not new_listings_m.empty:
+        st.bar_chart(new_listings_m.tail(48).set_index("date")[["value"]],
+                     height=200, color="#22c55e")
+    else:
+        st.info("No new-listings data.")
+with p5:
+    st.markdown("**Median sale price** — actual closings vs ZHVI estimate")
+    sp_now, sp_yoy = latest_and_yoy(sale_price_m)
+    st.caption(f"Zillow · monthly · {fmt_money(sp_now)} median sale"
+               + (f" · {fmt_pct(sp_yoy)} YoY" if sp_yoy is not None else "")
+               if sp_now is not None else "Zillow · monthly")
+    if not sale_price_m.empty:
+        st.line_chart(sale_price_m.tail(72).set_index("date")[["value"]],
+                      height=200, color="#0ea5e9")
+    else:
+        st.info("No sale-price data.")
+
+# ── By ZIP drill-down ──────────────────────────────────────────────────
+with st.expander("By ZIP — value & yield (drill below county)"):
+    if zips_df.empty:
+        st.info("No ZIP-level snapshot for this market yet.")
+    else:
+        zhvi_z = zips_df[zips_df["kind"] == "zhvi"]
+        zori_z = zips_df[zips_df["kind"] == "zori"]
+        zhvi_zl = zhvi_z.sort_values("date").groupby(["zip", "county"]).tail(1)
+        zori_zl = (zori_z.sort_values("date").groupby("zip").tail(1)
+                   .set_index("zip")["value"]) if not zori_z.empty else pd.Series(dtype=float)
+        rows = []
+        for _, zr in zhvi_zl.iterrows():
+            zv = float(zr["value"])
+            zrent = zori_zl.get(zr["zip"])
+            cr_z = cap_rate(zv, zrent) if zrent and not pd.isna(zrent) else None
+            rows.append({
+                "ZIP": zr["zip"],
+                "County": str(zr["county"]).replace(" County", ""),
+                "Median value": zv,
+                "Median rent": float(zrent) if zrent and not pd.isna(zrent) else None,
+                "Gross cap %": round(cr_z.gross, 2) if cr_z else None,
+            })
+        zdf = pd.DataFrame(rows).sort_values("Gross cap %", ascending=False, na_position="last")
+        st.caption(f"{len(zdf)} ZIP codes across {market.label}. Rent + cap rate "
+                   f"shown only where Zillow publishes ZIP-level ZORI. Sort any column.")
+        st.dataframe(
+            zdf, width="stretch", hide_index=True,
+            column_config={
+                "Median value": st.column_config.NumberColumn(format="$%d"),
+                "Median rent": st.column_config.NumberColumn(format="$%d"),
+                "Gross cap %": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
 
 # ── Labor + supply + rates charts ──────────────────────────────────────
 st.subheader("Labor, supply & rates")
@@ -624,11 +828,24 @@ if summary_rows:
             "Median rent": sdf["rent"].apply(lambda v: fmt_money(v) if v else "—"),
             "Value YoY": sdf["value_yoy"].apply(lambda v: fmt_pct(v) if v is not None else "—"),
             "Cap rate": sdf["cap_rate"],
+            "Days to pending": sdf.get("days_pending"),
+            "Sale-to-list": (sdf.get("sale_to_list") * 100
+                             if "sale_to_list" in sdf else None),
         }),
         width="stretch", hide_index=True,
-        column_config={"Cap rate": st.column_config.ProgressColumn(
-            "Gross cap rate", format="%.2f%%", min_value=0, max_value=10)},
+        column_config={
+            "Cap rate": st.column_config.ProgressColumn(
+                "Gross cap rate", format="%.2f%%", min_value=0, max_value=10),
+            "Days to pending": st.column_config.NumberColumn(
+                "Days to pending", format="%d d",
+                help="Median days a listing takes to go pending — lower = faster market"),
+            "Sale-to-list": st.column_config.NumberColumn(
+                "Sale-to-list", format="%.1f%%",
+                help="Sale price as % of list — under 100% = negotiating room"),
+        },
     )
+    st.caption("Days-to-pending & sale-to-list: Zillow Research. Lower DOM and "
+               "lower sale-to-list both favor buyers.")
 else:
     st.info("No market snapshots yet — run `python scripts/build_snapshot.py`.")
 

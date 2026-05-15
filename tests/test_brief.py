@@ -75,3 +75,19 @@ def test_softening_market_when_both_negative():
 def test_permits_rising_flagged_as_supply_headwind():
     b = generate_brief(_base(permits_latest=12_000, permits_prior=9_000))
     assert any("supply pipeline is expanding" in h for h in b.happening)
+
+
+def test_slower_sales_flagged_as_buyer_leverage():
+    b = generate_brief(_base(days_pending=48, days_pending_yr_ago=32))
+    assert any("longer than a year ago" in h for h in b.happening)
+
+
+def test_rising_inventory_flagged():
+    b = generate_brief(_base(inventory=8_000, inventory_yr_ago=6_000))
+    assert any("inventory is up" in h for h in b.happening)
+
+
+def test_low_sale_to_list_is_discount_signal_and_tactic():
+    b = generate_brief(_base(sale_to_list=0.96, sale_to_list_yr_ago=1.0))
+    assert any("of list price" in h for h in b.happening)
+    assert any("under list" in t for t in b.tactics)

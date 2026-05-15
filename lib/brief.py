@@ -27,6 +27,12 @@ class MarketSnapshot:
     permits_latest: float | None = None     # total metro units, latest yr
     permits_prior: float | None = None      # total metro units, prior yr
     permits_latest_year: int | None = None
+    days_pending: float | None = None       # current days-to-pending
+    days_pending_yr_ago: float | None = None
+    inventory: float | None = None          # current for-sale inventory
+    inventory_yr_ago: float | None = None
+    sale_to_list: float | None = None       # current ratio, e.g. 0.98
+    sale_to_list_yr_ago: float | None = None
     county_caps: dict[str, float] = field(default_factory=dict)   # short name -> gross cap %
     county_values: dict[str, float] = field(default_factory=dict)  # short name -> median value
 
@@ -172,7 +178,54 @@ def generate_brief(snap: MarketSnapshot) -> Brief:
                 f"a stable demand backdrop."
             )
 
-    # ── Rule 5: intra-metro county spread ──────────────────────────────
+    # ── Rule 5: market pace — days-to-pending ──────────────────────────
+    if snap.days_pending is not None and snap.days_pending_yr_ago:
+        dp_chg = (snap.days_pending - snap.days_pending_yr_ago) / snap.days_pending_yr_ago * 100
+        if dp_chg > 8:
+            happening.append(
+                f"Homes are taking ~{snap.days_pending:.0f} days to go pending, "
+                f"{dp_chg:.0f}% longer than a year ago — buyers are gaining leverage."
+            )
+        elif dp_chg < -8:
+            happening.append(
+                f"Homes go pending in ~{snap.days_pending:.0f} days, "
+                f"{abs(dp_chg):.0f}% faster than a year ago — sellers still hold the edge."
+            )
+        else:
+            happening.append(
+                f"Homes go pending in ~{snap.days_pending:.0f} days — a steady "
+                f"pace versus a year ago."
+            )
+
+    # ── Rule 6: for-sale inventory ─────────────────────────────────────
+    if snap.inventory is not None and snap.inventory_yr_ago:
+        inv_chg = (snap.inventory - snap.inventory_yr_ago) / snap.inventory_yr_ago * 100
+        if inv_chg > 8:
+            happening.append(
+                f"For-sale inventory is up {inv_chg:.0f}% YoY (~{snap.inventory:,.0f} "
+                f"homes) — more selection and negotiating room for buyers."
+            )
+        elif inv_chg < -8:
+            happening.append(
+                f"For-sale inventory is down {abs(inv_chg):.0f}% YoY (~{snap.inventory:,.0f} "
+                f"homes) — scarcity that supports prices."
+            )
+
+    # ── Rule 7: sale-to-list ratio ─────────────────────────────────────
+    if snap.sale_to_list is not None:
+        stl_pct = snap.sale_to_list * 100
+        if snap.sale_to_list < 0.985:
+            happening.append(
+                f"Homes are closing at {stl_pct:.1f}% of list price — sellers are "
+                f"conceding, a clear discount signal."
+            )
+        elif snap.sale_to_list > 1.0:
+            happening.append(
+                f"Homes are closing at {stl_pct:.1f}% of list — above ask; "
+                f"expect competition on clean listings."
+            )
+
+    # ── Rule 8: intra-metro county spread ──────────────────────────────
     if len(snap.county_values) >= 2:
         cheap = min(snap.county_values.items(), key=lambda kv: kv[1])
         rich = max(snap.county_values.items(), key=lambda kv: kv[1])
@@ -245,6 +298,12 @@ def generate_brief(snap: MarketSnapshot) -> Brief:
         tactics.append(
             f"Rising rates plus a thin {snap.gross_yield:.2f}% yield: underwrite "
             f"conservatively and stress-test every deal at +50 bps."
+        )
+
+    if snap.sale_to_list is not None and snap.sale_to_list < 0.98:
+        tactics.append(
+            f"Sellers are accepting ~{(1 - snap.sale_to_list) * 100:.0f}% under list — "
+            f"open negotiations low; under-ask offers are landing right now."
         )
 
     return Brief(state=state, happening=happening, tactics=tactics)
