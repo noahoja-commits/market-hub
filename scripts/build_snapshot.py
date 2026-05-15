@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from lib.markets import MARKETS  # noqa: E402
-from lib.sources import bls, census_bps  # noqa: E402
+from lib.sources import bls, census_bps, fred_api  # noqa: E402
 
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -173,6 +173,22 @@ def build_indicators_all_markets() -> dict[str, bool]:
     except Exception as e:
         print(f"  [fail] PMMS mortgage: {e.__class__.__name__}: {e}", file=sys.stderr)
 
+    # Macro-rate context via the FRED API (national, optional — needs a key).
+    macro: dict[str, pd.DataFrame] = {}
+    fred_key = fred_api.get_api_key()
+    if fred_key:
+        for name, series_id in [("treasury_10yr", fred_api.TREASURY_10Y),
+                                ("fed_funds", fred_api.FED_FUNDS)]:
+            try:
+                df = fred_api.fetch_observations(series_id, fred_key)
+                if not df.empty:
+                    macro[name] = df
+                    print(f"  [ok] FRED {series_id} ({name}): {len(df):,} obs")
+            except Exception as e:
+                print(f"  [fail] FRED {series_id}: {e.__class__.__name__}", file=sys.stderr)
+    else:
+        print("  [skip] FRED macro — no API key (set FRED_API_KEY)")
+
     results: dict[str, bool] = {}
     for market in MARKETS:
         frames: list[pd.DataFrame] = []
@@ -182,6 +198,13 @@ def build_indicators_all_markets() -> dict[str, bool]:
             m["series"] = "mortgage_30yr"
             m["county"] = pd.NA
             frames.append(m)
+
+        # National macro-rate series — same for every market.
+        for name, df in macro.items():
+            mac = df.copy()
+            mac["series"] = name
+            mac["county"] = pd.NA
+            frames.append(mac)
 
         # BLS unemployment
         try:

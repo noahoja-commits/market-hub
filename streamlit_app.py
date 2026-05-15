@@ -65,6 +65,7 @@ SOURCE_INFO = [
     ("MSA unemployment", "BLS LAUS (public API)", "Monthly", "https://www.bls.gov/lau/"),
     ("MSA employment", "BLS CES (public API)", "Monthly", "https://www.bls.gov/ces/"),
     ("Building permits", "Census Building Permits Survey", "Annual", "https://www.census.gov/construction/bps/"),
+    ("10-yr Treasury / Fed funds", "FRED API (St. Louis Fed)", "Daily / Monthly", "https://fred.stlouisfed.org/"),
 ]
 
 
@@ -336,6 +337,8 @@ mortgage = indicator_series(indicators, "mortgage_30yr")
 unemp = indicator_series(indicators, "unemployment")
 employment = indicator_series(indicators, "employment")
 permits_metro = permits_by_year(indicators)
+treasury10 = indicator_series(indicators, "treasury_10yr")
+fed_funds = indicator_series(indicators, "fed_funds")
 
 zhvi_latest = latest_per_county(zhvi).set_index("RegionName")
 zori_latest = latest_per_county(zori).set_index("RegionName")
@@ -574,6 +577,39 @@ with rc:
         st.caption(f"BLS CES · monthly · total nonfarm jobs (thousands)"
                    + (f" · {fmt_pct(emp_yoy)} YoY" if emp_yoy is not None else ""))
         st.line_chart(employment.tail(72).set_index("date")[["value"]], height=220, color="#0ea5e9")
+
+# ── Macro backdrop ─────────────────────────────────────────────────────
+if not treasury10.empty or not fed_funds.empty:
+    st.subheader("Macro backdrop")
+    st.caption("The rate environment every FL deal is underwritten against. "
+               "30-yr mortgage rates track the 10-yr Treasury plus a ~2.5–3 pt spread.")
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        t10 = treasury10["value"].iloc[-1] if not treasury10.empty else None
+        t10_as_of = treasury10["date"].max().strftime("%b %d, %Y") if not treasury10.empty else "—"
+        st.markdown("**10-year Treasury yield**")
+        st.caption(f"FRED · DGS10 · daily · {t10:.2f}% as of {t10_as_of}"
+                   if t10 is not None else "FRED · DGS10 · daily")
+        if not treasury10.empty:
+            st.line_chart(treasury10.tail(500).set_index("date")[["value"]],
+                          height=200, color="#0ea5e9")
+    with mc2:
+        ff = fed_funds["value"].iloc[-1] if not fed_funds.empty else None
+        ff_as_of = fed_funds["date"].max().strftime("%b %Y") if not fed_funds.empty else "—"
+        st.markdown("**Federal funds rate**")
+        st.caption(f"FRED · FEDFUNDS · monthly · {ff:.2f}% as of {ff_as_of}"
+                   if ff is not None else "FRED · FEDFUNDS · monthly")
+        if not fed_funds.empty:
+            st.line_chart(fed_funds.tail(120).set_index("date")[["value"]],
+                          height=200, color="#a855f7")
+    if not treasury10.empty and not mortgage.empty:
+        spread = last_mortgage - treasury10["value"].iloc[-1]
+        st.caption(f"Current 30-yr mortgage ({last_mortgage:.2f}%) sits "
+                   f"{spread:.2f} pts above the 10-yr Treasury "
+                   f"({treasury10['value'].iloc[-1]:.2f}%) — "
+                   + ("a wide spread; rates have room to fall if the spread normalizes."
+                      if spread > 2.9 else
+                      "a normal spread."))
 
 # ── Compare all FL markets ─────────────────────────────────────────────
 st.subheader("Compare all FL markets")

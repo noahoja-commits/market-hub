@@ -29,6 +29,9 @@ jobs:
       - name: Build snapshot
         env:
           PYTHONIOENCODING: utf-8
+          # Optional — add a repo secret named FRED_API_KEY to include
+          # the macro-rate series. Build still succeeds without it.
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: python scripts/build_snapshot.py
 
       - name: Commit + push if changed
