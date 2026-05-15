@@ -1,16 +1,14 @@
 """Build pre-baked data snapshots for the market-hub Streamlit app.
 
 Run this script to refresh `data/*.parquet` and `data/commentary.json`
-from the upstream sources (Zillow Research, FRED, public commentary sites).
-
-The Streamlit app reads these files instead of hitting the network on each
-page load, so the app loads in <1s even when FRED is flaky.
+from upstream (Zillow Research, FRED, public commentary sites). The
+Streamlit app reads these files first so it loads in <1s.
 
 Usage:
     python scripts/build_snapshot.py
 
-Exit code is non-zero only if every source fails. Individual failures
-are tolerated — the existing snapshot files are kept untouched.
+Exit code is non-zero only if every step fails. Individual failures
+are tolerated — existing snapshot files are kept untouched.
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from io import StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -29,19 +26,16 @@ import requests
 from bs4 import BeautifulSoup
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from lib.markets import MARKETS, Market  # noqa: E402
+
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────
-# Sources (mirrored from streamlit_app.py — keep in sync)
+# URLs / constants
 # ──────────────────────────────────────────────────────────────────────
-
-TAMPA_COUNTIES = [
-    "Hillsborough County",
-    "Pinellas County",
-    "Pasco County",
-    "Hernando County",
-]
 
 ZHVI_URL = (
     "https://files.zillowstatic.com/research/public_csvs/zhvi/"
@@ -51,7 +45,10 @@ ZORI_URL = (
     "https://files.zillowstatic.com/research/public_csvs/zori/"
     "County_zori_uc_sfrcondomfr_sm_month.csv"
 )
-FRED_SERIES = ["MORTGAGE30US", "ATNHPIUS45300Q", "TAMP312URN"]
+FRED_TMPL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+
+# Mortgage rate is global, shared by every market
+GLOBAL_FRED_SERIES = ["MORTGAGE30US"]
 
 COMMENTARY_SOURCES = [
     {"name": "iBuyer — Tampa Investor Market Report", "url": "https://ibuyer.com/blog/tampa-investor-market-report/"},
@@ -72,25 +69,33 @@ UA = (
 HEADERS = {"User-Agent": UA}
 
 # ──────────────────────────────────────────────────────────────────────
-# Fetchers (no streamlit dependencies — pure)
+# Fetchers (pure, no streamlit)
 # ──────────────────────────────────────────────────────────────────────
 
 
-def fetch_zillow_long(url: str, kind: str) -> pd.DataFrame:
-    """Stream Zillow CSV to a temp file (avoids holding 13MB twice in memory),
-    then read + filter to Tampa Bay counties only."""
+def download_to_tmp(url: str, timeout: int = 180) -> Path:
+    """Stream a URL to a tmp file. Avoids holding huge CSVs twice in memory."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-        with requests.get(url, headers=HEADERS, timeout=180, stream=True) as r:
+        with requests.get(url, headers=HEADERS, timeout=timeout, stream=True) as r:
             r.raise_for_status()
             for chunk in r.iter_content(chunk_size=64 * 1024):
                 if chunk:
                     tmp.write(chunk)
-        tmp_path = tmp.name
+        return Path(tmp.name)
+
+
+def load_zillow_csv(url: str) -> pd.DataFrame:
+    """Download a Zillow county CSV and return the raw wide DataFrame."""
+    tmp_path = download_to_tmp(url)
     try:
-        df = pd.read_csv(tmp_path)
+        return pd.read_csv(tmp_path)
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
-    df = df[(df["StateName"] == "FL") & (df["RegionName"].isin(TAMPA_COUNTIES))]
+        tmp_path.unlink(missing_ok=True)
+
+
+def melt_zillow(df: pd.DataFrame, counties: list[str], state: str, kind: str) -> pd.DataFrame:
+    """Filter wide Zillow CSV to one market's counties + melt to long form."""
+    df = df[(df["StateName"] == state) & (df["RegionName"].isin(counties))]
     date_cols = [c for c in df.columns if DATE_RE.match(str(c))]
     long = df.melt(
         id_vars=["RegionName"],
@@ -105,8 +110,8 @@ def fetch_zillow_long(url: str, kind: str) -> pd.DataFrame:
 
 
 def fetch_fred_series(series_id: str) -> pd.DataFrame:
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    # Retry FRED multiple times — endpoint is flaky.
+    """Fetch one FRED CSV series with retries (FRED is flaky)."""
+    url = FRED_TMPL.format(series_id=series_id)
     last_err: Exception | None = None
     for attempt in range(4):
         try:
@@ -119,6 +124,7 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
                 time.sleep(3 * (attempt + 1))
                 continue
             raise
+    from io import StringIO
     df = pd.read_csv(StringIO(r.text))
     date_col = "observation_date" if "observation_date" in df.columns else "DATE"
     df = df.rename(columns={date_col: "date", series_id: "value"})
@@ -167,48 +173,72 @@ def fetch_commentary(url: str) -> dict:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def build_zillow() -> bool:
-    """Fetch ZHVI + ZORI, write to data/tampa-bay-zillow.parquet."""
-    print("[zillow] fetching ZHVI + ZORI...", flush=True)
-    frames: list[pd.DataFrame] = []
+def build_zillow_all_markets() -> dict[str, bool]:
+    """Download Zillow ZHVI+ZORI once, filter for each market, write parquet per market."""
+    print("[zillow] downloading ZHVI + ZORI CSVs (once for all markets)...", flush=True)
+    raw: dict[str, pd.DataFrame] = {}
     for url, kind in [(ZHVI_URL, "zhvi"), (ZORI_URL, "zori")]:
         try:
-            df = fetch_zillow_long(url, kind)
-            print(f"  [ok]{kind}: {len(df):,} rows × {df['RegionName'].nunique()} counties")
-            frames.append(df)
+            raw[kind] = load_zillow_csv(url)
+            print(f"  [ok] {kind}: {len(raw[kind]):,} total county-rows")
         except Exception as e:
-            print(f"  [fail]{kind}: {e.__class__.__name__}: {e}", file=sys.stderr)
-    if not frames:
-        return False
-    combined = pd.concat(frames, ignore_index=True)
-    path = DATA_DIR / "tampa-bay-zillow.parquet"
-    combined.to_parquet(path, index=False, compression="zstd")
-    print(f"  → {path.relative_to(ROOT)} ({path.stat().st_size:,} bytes)")
-    return True
+            print(f"  [fail] {kind}: {e.__class__.__name__}: {e}", file=sys.stderr)
+    if not raw:
+        return {m.slug: False for m in MARKETS}
 
-
-def build_fred() -> bool:
-    """Fetch all FRED series, write to data/tampa-bay-fred.parquet."""
-    print("[fred] fetching series...", flush=True)
-    frames: list[pd.DataFrame] = []
-    for series_id in FRED_SERIES:
+    results: dict[str, bool] = {}
+    for market in MARKETS:
         try:
-            df = fetch_fred_series(series_id)
-            print(f"  [ok]{series_id}: {len(df):,} observations")
-            frames.append(df)
+            frames = []
+            for kind, wide in raw.items():
+                frames.append(melt_zillow(wide, market.counties, market.state, kind))
+            combined = pd.concat(frames, ignore_index=True)
+            path = DATA_DIR / f"{market.slug}-zillow.parquet"
+            combined.to_parquet(path, index=False, compression="zstd")
+            n_counties = combined["RegionName"].nunique()
+            print(f"  [ok] {market.slug}: {len(combined):,} rows × {n_counties} counties → {path.name}")
+            results[market.slug] = True
         except Exception as e:
-            print(f"  [fail]{series_id}: {e.__class__.__name__}: {e}", file=sys.stderr)
-    if not frames:
-        return False
-    combined = pd.concat(frames, ignore_index=True)
-    path = DATA_DIR / "tampa-bay-fred.parquet"
-    combined.to_parquet(path, index=False, compression="zstd")
-    print(f"  → {path.relative_to(ROOT)} ({path.stat().st_size:,} bytes)")
-    return True
+            print(f"  [fail] {market.slug}: {e.__class__.__name__}: {e}", file=sys.stderr)
+            results[market.slug] = False
+    return results
+
+
+def build_fred_all_markets() -> dict[str, bool]:
+    """For each market, fetch its FRED series + the global ones, write parquet."""
+    print("[fred] fetching series per market...", flush=True)
+
+    # Cache global series so we only fetch them once
+    global_cache: dict[str, pd.DataFrame] = {}
+    for sid in GLOBAL_FRED_SERIES:
+        try:
+            global_cache[sid] = fetch_fred_series(sid)
+            print(f"  [ok] {sid} (global): {len(global_cache[sid]):,} obs")
+        except Exception as e:
+            print(f"  [fail] {sid} (global): {e.__class__.__name__}: {e}", file=sys.stderr)
+
+    results: dict[str, bool] = {}
+    for market in MARKETS:
+        frames: list[pd.DataFrame] = list(global_cache.values())
+        for purpose, sid in market.fred_series.items():
+            try:
+                frames.append(fetch_fred_series(sid))
+                print(f"  [ok] {market.slug}/{purpose} ({sid}): added")
+            except Exception as e:
+                print(f"  [fail] {market.slug}/{purpose} ({sid}): {e.__class__.__name__}", file=sys.stderr)
+        if not frames:
+            results[market.slug] = False
+            continue
+        combined = pd.concat(frames, ignore_index=True)
+        path = DATA_DIR / f"{market.slug}-fred.parquet"
+        combined.to_parquet(path, index=False, compression="zstd")
+        print(f"  [ok] {market.slug}: {len(combined):,} rows → {path.name}")
+        results[market.slug] = True
+    return results
 
 
 def build_commentary() -> bool:
-    """Fetch all commentary sources in parallel, write data/commentary.json."""
+    """Single commentary set, shared across markets."""
     print("[commentary] fetching sources in parallel...", flush=True)
     urls = [s["url"] for s in COMMENTARY_SOURCES]
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -218,7 +248,7 @@ def build_commentary() -> bool:
         "sources": {url: res for url, res in zip(urls, results)},
     }
     ok = sum(1 for r in results if r.get("ok"))
-    print(f"  [ok]{ok}/{len(results)} sources reachable")
+    print(f"  [ok] {ok}/{len(results)} sources reachable")
     path = DATA_DIR / "commentary.json"
     path.write_text(json.dumps(payload, indent=2))
     print(f"  → {path.relative_to(ROOT)} ({path.stat().st_size:,} bytes)")
@@ -227,16 +257,17 @@ def build_commentary() -> bool:
 
 def main() -> int:
     started = time.time()
-    print(f"Building snapshot in {DATA_DIR}")
-    results = {
-        "zillow": build_zillow(),
-        "fred": build_fred(),
-        "commentary": build_commentary(),
-    }
+    print(f"Building snapshot for {len(MARKETS)} markets in {DATA_DIR}")
+    zillow_results = build_zillow_all_markets()
+    fred_results = build_fred_all_markets()
+    commentary_ok = build_commentary()
     elapsed = time.time() - started
-    ok = sum(results.values())
-    print(f"\nDone — {ok}/{len(results)} steps succeeded ({elapsed:.1f}s)")
-    return 0 if ok > 0 else 1
+    total_ok = sum(zillow_results.values()) + sum(fred_results.values()) + (1 if commentary_ok else 0)
+    print(f"\nDone — Zillow {sum(zillow_results.values())}/{len(MARKETS)}, "
+          f"FRED {sum(fred_results.values())}/{len(MARKETS)}, "
+          f"Commentary {'ok' if commentary_ok else 'fail'}. "
+          f"Elapsed: {elapsed:.1f}s")
+    return 0 if total_ok > 0 else 1
 
 
 if __name__ == "__main__":

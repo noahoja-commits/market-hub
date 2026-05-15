@@ -1,7 +1,8 @@
-"""Tampa Bay Market Hub — Streamlit dashboard.
+"""Florida Market Hub — Streamlit dashboard.
 
 Pulls free public data (Zillow Research, FRED) plus latest commentary
-from local Tampa Bay realtor/PM/research blogs. No API keys.
+from local realtor / PM / research blogs across multiple FL metros.
+No API keys.
 """
 
 from __future__ import annotations
@@ -19,21 +20,15 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 from lib.deal_math import brrrr_refinance, cap_rate, mao_70, piti, price_to_rent
+from lib.markets import MARKETS, MARKETS_BY_SLUG, Market
 
 DATA_DIR = Path(__file__).parent / "data"
 
 st.set_page_config(
-    page_title="Tampa Bay Market Hub",
+    page_title="FL Market Hub",
     page_icon=":house:",
     layout="wide",
 )
-
-TAMPA_COUNTIES = [
-    "Hillsborough County",
-    "Pinellas County",
-    "Pasco County",
-    "Hernando County",
-]
 
 ZHVI_URL = (
     "https://files.zillowstatic.com/research/public_csvs/zhvi/"
@@ -112,9 +107,9 @@ def _empty_series() -> pd.DataFrame:
     return pd.DataFrame({"date": [], "value": []})
 
 
-def _zillow_from_snapshot(kind: str) -> pd.DataFrame | None:
-    """Read pre-baked Zillow snapshot for given kind ('zhvi' or 'zori')."""
-    path = DATA_DIR / "tampa-bay-zillow.parquet"
+def _zillow_from_snapshot(market_slug: str, kind: str) -> pd.DataFrame | None:
+    """Read pre-baked Zillow snapshot for the given market + kind."""
+    path = DATA_DIR / f"{market_slug}-zillow.parquet"
     if not path.exists():
         return None
     try:
@@ -125,8 +120,8 @@ def _zillow_from_snapshot(kind: str) -> pd.DataFrame | None:
         return None
 
 
-def _fred_from_snapshot(series_id: str) -> pd.DataFrame | None:
-    path = DATA_DIR / "tampa-bay-fred.parquet"
+def _fred_from_snapshot(market_slug: str, series_id: str) -> pd.DataFrame | None:
+    path = DATA_DIR / f"{market_slug}-fred.parquet"
     if not path.exists():
         return None
     try:
@@ -138,20 +133,17 @@ def _fred_from_snapshot(series_id: str) -> pd.DataFrame | None:
 
 
 @st.cache_data(ttl=WEEK, show_spinner=False)
-def fetch_zillow(url: str) -> pd.DataFrame:
-    """Read pre-baked snapshot if available, else live-fetch.
-
-    Returns empty DataFrame on failure so the page still renders.
-    """
+def fetch_zillow(url: str, market_slug: str, counties: tuple[str, ...], state: str) -> pd.DataFrame:
+    """Read pre-baked snapshot if available, else live-fetch."""
     kind = "zhvi" if "zhvi" in url else "zori"
-    snap = _zillow_from_snapshot(kind)
+    snap = _zillow_from_snapshot(market_slug, kind)
     if snap is not None:
         return snap
     try:
         r = requests.get(url, headers=HEADERS, timeout=120)
         r.raise_for_status()
         df = pd.read_csv(StringIO(r.text))
-        df = df[(df["StateName"] == "FL") & (df["RegionName"].isin(TAMPA_COUNTIES))]
+        df = df[(df["StateName"] == state) & (df["RegionName"].isin(list(counties)))]
         date_cols = [c for c in df.columns if DATE_RE.match(str(c))]
         long = df.melt(
             id_vars=["RegionName"],
@@ -168,12 +160,9 @@ def fetch_zillow(url: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=DAY, show_spinner=False)
-def fetch_fred(series_id: str) -> pd.DataFrame:
-    """Read pre-baked snapshot if available, else live-fetch.
-
-    Returns empty DataFrame on failure so the page still renders.
-    """
-    snap = _fred_from_snapshot(series_id)
+def fetch_fred(series_id: str, market_slug: str) -> pd.DataFrame:
+    """Read pre-baked snapshot if available, else live-fetch."""
+    snap = _fred_from_snapshot(market_slug, series_id)
     if snap is not None:
         return snap
     try:
@@ -265,12 +254,12 @@ def fetch_all_commentary(urls_key: tuple[str, ...]) -> dict[str, dict]:
     return out
 
 
-def snapshot_freshness() -> dict[str, str]:
+def snapshot_freshness(market_slug: str) -> dict[str, str]:
     """Return human-readable last-modified timestamps for each snapshot file."""
     out: dict[str, str] = {}
     for label, fname in [
-        ("Zillow", "tampa-bay-zillow.parquet"),
-        ("FRED", "tampa-bay-fred.parquet"),
+        ("Zillow", f"{market_slug}-zillow.parquet"),
+        ("FRED", f"{market_slug}-fred.parquet"),
         ("Commentary", "commentary.json"),
     ]:
         path = DATA_DIR / fname
@@ -325,12 +314,30 @@ def fmt_pct(n: float | None, sign: bool = True) -> str:
 # UI
 # ──────────────────────────────────────────────────────────────────────
 
-st.title("Tampa Bay Market Hub")
-st.caption("Hillsborough · Pinellas · Pasco · Hernando")
+# ── Market selector at top ────────────────────────────────────────────
+default_slug = st.query_params.get("market", "tampa-bay")
+if default_slug not in MARKETS_BY_SLUG:
+    default_slug = "tampa-bay"
+
+st.title("FL Market Hub")
+
+market_labels = [m.label for m in MARKETS]
+selected_label = st.segmented_control(
+    "Market",
+    market_labels,
+    default=MARKETS_BY_SLUG[default_slug].label,
+    label_visibility="collapsed",
+)
+if selected_label is None:
+    selected_label = MARKETS_BY_SLUG[default_slug].label
+market: Market = next(m for m in MARKETS if m.label == selected_label)
+st.query_params["market"] = market.slug
+
+st.caption(" · ".join(c.replace(" County", "") for c in market.counties))
 
 with st.sidebar:
     st.header("Snapshot status")
-    freshness = snapshot_freshness()
+    freshness = snapshot_freshness(market.slug)
     for label, ts in freshness.items():
         if ts == "live":
             st.caption(f"**{label}:** live fetch (no snapshot)")
@@ -349,23 +356,24 @@ with st.sidebar:
         "plus local realtor/PM blogs (see Commentary section)."
     )
 
-# Single visible load-progress block — shows what's happening on first run.
-status = st.status("Loading market data...", expanded=True)
+counties_t = tuple(market.counties)
+status = st.status(f"Loading {market.label} data...", expanded=False)
 with status:
-    st.write("Fetching Zillow home values (ZHVI)...")
-    zhvi = fetch_zillow(ZHVI_URL)
-    st.write(f"  ✓ {len(zhvi):,} rows")
-    st.write("Fetching Zillow rents (ZORI)...")
-    zori = fetch_zillow(ZORI_URL)
-    st.write(f"  ✓ {len(zori):,} rows")
-    st.write("Fetching FRED mortgage rate...")
-    mortgage = fetch_fred("MORTGAGE30US")
-    st.write(f"  ✓ {len(mortgage):,} observations")
-    st.write("Fetching FRED Tampa HPI + unemployment...")
-    hpi = fetch_fred("ATNHPIUS45300Q")
-    unemp = fetch_fred("TAMP312URN")
-    st.write(f"  ✓ HPI {len(hpi)}, unemployment {len(unemp)}")
-status.update(label="Market data loaded.", state="complete", expanded=False)
+    st.write("Zillow home values (ZHVI)...")
+    zhvi = fetch_zillow(ZHVI_URL, market.slug, counties_t, market.state)
+    st.write(f"  [{len(zhvi):,} rows]")
+    st.write("Zillow rents (ZORI)...")
+    zori = fetch_zillow(ZORI_URL, market.slug, counties_t, market.state)
+    st.write(f"  [{len(zori):,} rows]")
+    st.write("FRED 30-yr mortgage rate...")
+    mortgage = fetch_fred("MORTGAGE30US", market.slug)
+    st.write(f"  [{len(mortgage):,} observations]")
+    hpi_id = market.fred_series.get("hpi")
+    unemp_id = market.fred_series.get("unemp")
+    hpi = fetch_fred(hpi_id, market.slug) if hpi_id else _empty_series()
+    unemp = fetch_fred(unemp_id, market.slug) if unemp_id else _empty_series()
+    st.write(f"  [HPI {len(hpi)}, unemployment {len(unemp)}]")
+status.update(label=f"{market.label} data loaded.", state="complete", expanded=False)
 
 zhvi_latest = latest_per_county(zhvi).set_index("RegionName")
 zori_latest = latest_per_county(zori).set_index("RegionName")
@@ -394,7 +402,7 @@ c1.metric(
     "Median home value",
     fmt_money(metro_value),
     f"{fmt_pct(metro_value_yoy)} YoY" if metro_value_yoy is not None else None,
-    help=f"Zillow ZHVI · avg of 4 counties · as of {zhvi_as_of}",
+    help=f"Zillow ZHVI · avg of {len(market.counties)} counties · as of {zhvi_as_of}",
 )
 c2.metric(
     "Median rent",
@@ -423,7 +431,7 @@ st.caption(
 with st.container(border=True):
     in_col, out_col = st.columns([1, 1.4])
     with in_col:
-        county_short_to_full = {c.replace(" County", ""): c for c in TAMPA_COUNTIES}
+        county_short_to_full = {c.replace(" County", ""): c for c in market.counties}
         sel_short = st.selectbox(
             "County",
             list(county_short_to_full.keys()),
@@ -506,8 +514,8 @@ with st.container(border=True):
         )
 
 st.subheader("By county")
-cols = st.columns(len(TAMPA_COUNTIES))
-for col, county in zip(cols, TAMPA_COUNTIES):
+cols = st.columns(len(market.counties))
+for col, county in zip(cols, market.counties):
     short = county.replace(" County", "")
     v = zhvi_latest["value"].get(county)
     r = zori_latest["value"].get(county)
@@ -534,35 +542,39 @@ for col, county in zip(cols, TAMPA_COUNTIES):
                 color="#0ea5e9",
             )
 
-st.subheader("Tampa MSA — Home Price Index")
-hpi_yoy = None
-if len(hpi) >= 5:
-    hpi_yoy = (hpi["value"].iloc[-1] - hpi["value"].iloc[-5]) / hpi["value"].iloc[-5] * 100
-st.caption(
-    f"FRED · ATNHPIUS45300Q · quarterly"
-    + (f" · {fmt_pct(hpi_yoy)} YoY" if hpi_yoy is not None else "")
-)
-if not hpi.empty:
-    st.line_chart(hpi.tail(40).set_index("date")[["value"]], height=240, color="#0ea5e9")
-else:
-    st.info("HPI series unavailable.")
+if hpi_id:
+    st.subheader(f"{market.label} MSA — Home Price Index")
+    hpi_yoy = None
+    if len(hpi) >= 5:
+        hpi_yoy = (hpi["value"].iloc[-1] - hpi["value"].iloc[-5]) / hpi["value"].iloc[-5] * 100
+    st.caption(
+        f"FRED · {hpi_id} · quarterly"
+        + (f" · {fmt_pct(hpi_yoy)} YoY" if hpi_yoy is not None else "")
+    )
+    if not hpi.empty:
+        st.line_chart(hpi.tail(40).set_index("date")[["value"]], height=240, color="#0ea5e9")
+    else:
+        st.info("HPI series unavailable.")
 
 left, right = st.columns(2)
 with left:
-    st.subheader("Tampa MSA — Unemployment")
-    last_u = unemp["value"].iloc[-1] if not unemp.empty else None
-    st.caption(
-        f"FRED · TAMP312URN · monthly"
-        + (f" · {last_u:.1f}% latest" if last_u is not None else "")
-    )
-    if not unemp.empty:
-        st.line_chart(
-            unemp.tail(60).set_index("date")[["value"]],
-            height=240,
-            color="#f59e0b",
+    if unemp_id:
+        st.subheader(f"{market.label} MSA — Unemployment")
+        last_u = unemp["value"].iloc[-1] if not unemp.empty else None
+        st.caption(
+            f"FRED · {unemp_id} · monthly"
+            + (f" · {last_u:.1f}% latest" if last_u is not None else "")
         )
+        if not unemp.empty:
+            st.line_chart(
+                unemp.tail(60).set_index("date")[["value"]],
+                height=240,
+                color="#f59e0b",
+            )
+        else:
+            st.info("Unemployment series unavailable.")
     else:
-        st.info("Unemployment series unavailable.")
+        st.caption(f"_No unemployment series configured for {market.label} yet._")
 with right:
     st.subheader("30-yr fixed mortgage (US)")
     st.caption("FRED · MORTGAGE30US · weekly")
