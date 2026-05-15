@@ -254,6 +254,41 @@ def fetch_all_commentary(urls_key: tuple[str, ...]) -> dict[str, dict]:
     return out
 
 
+def load_market_summary(m: Market) -> dict | None:
+    """Compute a single-row summary for a market from its snapshot files."""
+    zhvi_df = _zillow_from_snapshot(m.slug, "zhvi")
+    zori_df = _zillow_from_snapshot(m.slug, "zori")
+    if zhvi_df is None and zori_df is None:
+        return None
+    row: dict = {"market": m.label, "slug": m.slug}
+    if zhvi_df is not None and not zhvi_df.empty:
+        latest = zhvi_df.sort_values("date").groupby("RegionName").tail(1)
+        row["value"] = float(latest["value"].mean())
+        yoys: list[float] = []
+        for _, grp in zhvi_df.groupby("RegionName"):
+            grp = grp.sort_values("date").reset_index(drop=True)
+            if len(grp) >= 13 and grp["value"].iloc[-13]:
+                yoys.append(
+                    (grp["value"].iloc[-1] - grp["value"].iloc[-13])
+                    / grp["value"].iloc[-13]
+                    * 100
+                )
+        row["value_yoy"] = sum(yoys) / len(yoys) if yoys else None
+    else:
+        row["value"] = None
+        row["value_yoy"] = None
+    if zori_df is not None and not zori_df.empty:
+        latest_r = zori_df.sort_values("date").groupby("RegionName").tail(1)
+        row["rent"] = float(latest_r["value"].mean())
+    else:
+        row["rent"] = None
+    if row.get("value") and row.get("rent"):
+        row["cap_rate"] = (row["rent"] * 12 / row["value"]) * 100
+    else:
+        row["cap_rate"] = None
+    return row
+
+
 def snapshot_freshness(market_slug: str) -> dict[str, str]:
     """Return human-readable last-modified timestamps for each snapshot file."""
     out: dict[str, str] = {}
@@ -608,6 +643,45 @@ with right:
         )
     else:
         st.info("Mortgage series unavailable.")
+
+# ──────────────────────────────────────────────────────────────────────
+# Compare all markets
+# ──────────────────────────────────────────────────────────────────────
+
+st.subheader("Compare all FL markets")
+st.caption(
+    "Side-by-side ranking of every metro in the dropdown — useful when "
+    "deciding where to deploy capital next. Sort any column."
+)
+summary_rows = [r for r in (load_market_summary(m) for m in MARKETS) if r]
+if summary_rows:
+    summary_df = pd.DataFrame(summary_rows)
+    display_df = pd.DataFrame({
+        "Market": summary_df["market"],
+        "Median value": summary_df["value"].apply(lambda v: fmt_money(v, compact=True) if v else "—"),
+        "Median rent": summary_df["rent"].apply(lambda v: fmt_money(v) if v else "—"),
+        "Value YoY": summary_df["value_yoy"].apply(lambda v: fmt_pct(v) if v is not None else "—"),
+        "Gross cap rate": summary_df["cap_rate"].apply(lambda v: f"{v:.2f}%" if v else "—"),
+        "Cap rate (sortable)": summary_df["cap_rate"],
+    })
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Cap rate (sortable)": st.column_config.ProgressColumn(
+                "Cap rate",
+                format="%.2f%%",
+                min_value=0,
+                max_value=10,
+            ),
+        },
+    )
+else:
+    st.info(
+        "No market snapshots yet — run `python scripts/build_snapshot.py` "
+        "or trigger the GitHub Action to populate `data/`."
+    )
 
 # ──────────────────────────────────────────────────────────────────────
 # Florida statewide context — same data for every market
