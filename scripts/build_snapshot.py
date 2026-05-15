@@ -1,8 +1,13 @@
 """Build pre-baked data snapshots for the market-hub Streamlit app.
 
-Run this script to refresh `data/*.parquet` and `data/commentary.json`
-from upstream (Zillow Research, FRED, public commentary sites). The
-Streamlit app reads these files first so it loads in <1s.
+Refreshes `data/*.parquet` and `data/commentary.json` from upstream
+sources. The app reads these files first so it loads in <1s.
+
+Sources (all reliable, no API keys):
+- Zillow Research  — county home values (ZHVI) + rents (ZORI)
+- Freddie Mac PMMS — national 30-yr fixed mortgage rate
+- BLS public API   — MSA unemployment (LAUS) + employment (CES)
+- Census BPS       — county building permits
 
 Usage:
     python scripts/build_snapshot.py
@@ -19,6 +24,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -28,14 +34,11 @@ from bs4 import BeautifulSoup
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from lib.markets import MARKETS, Market  # noqa: E402
+from lib.markets import MARKETS  # noqa: E402
+from lib.sources import bls, census_bps  # noqa: E402
 
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
-
-# ──────────────────────────────────────────────────────────────────────
-# URLs / constants
-# ──────────────────────────────────────────────────────────────────────
 
 ZHVI_URL = (
     "https://files.zillowstatic.com/research/public_csvs/zhvi/"
@@ -45,15 +48,7 @@ ZORI_URL = (
     "https://files.zillowstatic.com/research/public_csvs/zori/"
     "County_zori_uc_sfrcondomfr_sm_month.csv"
 )
-FRED_TMPL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-
-# FRED series that apply equally to every FL market — saved in every
-# market's parquet so the app can pull them with the same code path.
-GLOBAL_FRED_SERIES = [
-    "MORTGAGE30US",  # 30-yr fixed mortgage rate, US, weekly
-    "FLBPPRIV",      # FL new privately-owned housing units authorized, monthly
-    "FLSTHPI",       # FL all-transactions House Price Index (FHFA), quarterly
-]
+PMMS_URL = "https://www.freddiemac.com/pmms/docs/PMMS_history.csv"
 
 COMMENTARY_SOURCES = [
     {"name": "iBuyer — Tampa Investor Market Report", "url": "https://ibuyer.com/blog/tampa-investor-market-report/"},
@@ -73,13 +68,17 @@ UA = (
 )
 HEADERS = {"User-Agent": UA}
 
+# Year ranges
+THIS_YEAR = pd.Timestamp.now().year
+BLS_START = THIS_YEAR - 7
+PERMITS_START = THIS_YEAR - 12
+
 # ──────────────────────────────────────────────────────────────────────
-# Fetchers (pure, no streamlit)
+# Zillow
 # ──────────────────────────────────────────────────────────────────────
 
 
 def download_to_tmp(url: str, timeout: int = 180) -> Path:
-    """Stream a URL to a tmp file. Avoids holding huge CSVs twice in memory."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
         with requests.get(url, headers=HEADERS, timeout=timeout, stream=True) as r:
             r.raise_for_status()
@@ -90,7 +89,6 @@ def download_to_tmp(url: str, timeout: int = 180) -> Path:
 
 
 def load_zillow_csv(url: str) -> pd.DataFrame:
-    """Download a Zillow county CSV and return the raw wide DataFrame."""
     tmp_path = download_to_tmp(url)
     try:
         return pd.read_csv(tmp_path)
@@ -99,7 +97,6 @@ def load_zillow_csv(url: str) -> pd.DataFrame:
 
 
 def melt_zillow(df: pd.DataFrame, counties: list[str], state: str, kind: str) -> pd.DataFrame:
-    """Filter wide Zillow CSV to one market's counties + melt to long form."""
     df = df[(df["StateName"] == state) & (df["RegionName"].isin(counties))]
     date_cols = [c for c in df.columns if DATE_RE.match(str(c))]
     long = df.melt(
@@ -114,54 +111,129 @@ def melt_zillow(df: pd.DataFrame, counties: list[str], state: str, kind: str) ->
     return long.dropna(subset=["value"]).sort_values(["RegionName", "date"]).reset_index(drop=True)
 
 
-PMMS_URL = "https://www.freddiemac.com/pmms/docs/PMMS_history.csv"
+def build_zillow_all_markets() -> dict[str, bool]:
+    print("[zillow] downloading ZHVI + ZORI CSVs (once for all markets)...", flush=True)
+    raw: dict[str, pd.DataFrame] = {}
+    for url, kind in [(ZHVI_URL, "zhvi"), (ZORI_URL, "zori")]:
+        try:
+            raw[kind] = load_zillow_csv(url)
+            print(f"  [ok] {kind}: {len(raw[kind]):,} total county-rows")
+        except Exception as e:
+            print(f"  [fail] {kind}: {e.__class__.__name__}: {e}", file=sys.stderr)
+    if not raw:
+        return {m.slug: False for m in MARKETS}
+    results: dict[str, bool] = {}
+    for market in MARKETS:
+        try:
+            frames = [melt_zillow(w, market.counties, market.state, k) for k, w in raw.items()]
+            combined = pd.concat(frames, ignore_index=True)
+            path = DATA_DIR / f"{market.slug}-zillow.parquet"
+            combined.to_parquet(path, index=False, compression="zstd")
+            print(f"  [ok] {market.slug}: {len(combined):,} rows × "
+                  f"{combined['RegionName'].nunique()} counties → {path.name}")
+            results[market.slug] = True
+        except Exception as e:
+            print(f"  [fail] {market.slug}: {e.__class__.__name__}: {e}", file=sys.stderr)
+            results[market.slug] = False
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Mortgage (Freddie Mac PMMS)
+# ──────────────────────────────────────────────────────────────────────
 
 
 def fetch_pmms_mortgage() -> pd.DataFrame:
-    """Direct fetch of Freddie Mac's PMMS 30-yr fixed rate, weekly.
-
-    Bypasses FRED (which has been flaky). Saved with series="MORTGAGE30US"
-    so the existing app code finds it under the same key.
-    """
+    """Freddie Mac PMMS 30-yr fixed rate, weekly. Returns date/value."""
     r = requests.get(PMMS_URL, headers=HEADERS, timeout=30)
     r.raise_for_status()
-    from io import StringIO
     df = pd.read_csv(StringIO(r.text))
     out = pd.DataFrame({
         "date": pd.to_datetime(df["date"], errors="coerce"),
         "value": pd.to_numeric(df["pmms30"], errors="coerce"),
     })
-    out = out.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
-    out["series"] = "MORTGAGE30US"
-    return out
+    return out.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
 
 
-def fetch_fred_series(series_id: str) -> pd.DataFrame:
-    """Fetch one FRED CSV series with bounded retries.
+# ──────────────────────────────────────────────────────────────────────
+# Indicators — mortgage + unemployment + employment + permits per market
+# ──────────────────────────────────────────────────────────────────────
 
-    Max budget per series ~75s (2 attempts × 30s + 15s sleep) so a single
-    flaky series can't blow up a multi-market build."""
-    url = FRED_TMPL.format(series_id=series_id)
-    last_err: Exception | None = None
-    for attempt in range(2):
+
+def build_indicators_all_markets() -> dict[str, bool]:
+    """Write data/<slug>-indicators.parquet — long format:
+    columns [date, value, series, county]. county is set only for permits."""
+    print("[indicators] mortgage + BLS labor + Census permits...", flush=True)
+
+    # Mortgage is national — fetch once.
+    mortgage: pd.DataFrame | None = None
+    try:
+        mortgage = fetch_pmms_mortgage()
+        print(f"  [ok] PMMS mortgage: {len(mortgage):,} weekly obs")
+    except Exception as e:
+        print(f"  [fail] PMMS mortgage: {e.__class__.__name__}: {e}", file=sys.stderr)
+
+    results: dict[str, bool] = {}
+    for market in MARKETS:
+        frames: list[pd.DataFrame] = []
+
+        if mortgage is not None:
+            m = mortgage.copy()
+            m["series"] = "mortgage_30yr"
+            m["county"] = pd.NA
+            frames.append(m)
+
+        # BLS unemployment
         try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
-            r.raise_for_status()
-            break
+            u = bls.fetch_unemployment(market.bls_msa_code, BLS_START, THIS_YEAR)
+            if not u.empty:
+                u = u.copy()
+                u["series"] = "unemployment"
+                u["county"] = pd.NA
+                frames.append(u)
+                print(f"  [ok] {market.slug}/unemployment: {len(u)} obs")
         except Exception as e:
-            last_err = e
-            if attempt < 1:
-                time.sleep(15)
-                continue
-            raise
-    from io import StringIO
-    df = pd.read_csv(StringIO(r.text))
-    date_col = "observation_date" if "observation_date" in df.columns else "DATE"
-    df = df.rename(columns={date_col: "date", series_id: "value"})
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df["series"] = series_id
-    return df.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+            print(f"  [fail] {market.slug}/unemployment: {e.__class__.__name__}", file=sys.stderr)
+
+        # BLS employment
+        try:
+            e_df = bls.fetch_employment(market.bls_msa_code, BLS_START, THIS_YEAR)
+            if not e_df.empty:
+                e_df = e_df.copy()
+                e_df["series"] = "employment"
+                e_df["county"] = pd.NA
+                frames.append(e_df)
+                print(f"  [ok] {market.slug}/employment: {len(e_df)} obs")
+        except Exception as e:
+            print(f"  [fail] {market.slug}/employment: {e.__class__.__name__}", file=sys.stderr)
+
+        # Census permits (per county)
+        try:
+            p = census_bps.permits_timeseries(
+                market.state_fips, market.county_fips, PERMITS_START, THIS_YEAR
+            )
+            if not p.empty:
+                p = p.rename(columns={"total_units": "value"})
+                p["series"] = "permits"
+                frames.append(p[["date", "value", "series", "county"]])
+                print(f"  [ok] {market.slug}/permits: {len(p)} county-years")
+        except Exception as e:
+            print(f"  [fail] {market.slug}/permits: {e.__class__.__name__}", file=sys.stderr)
+
+        if not frames:
+            results[market.slug] = False
+            continue
+        combined = pd.concat(frames, ignore_index=True)
+        path = DATA_DIR / f"{market.slug}-indicators.parquet"
+        combined.to_parquet(path, index=False, compression="zstd")
+        print(f"  [ok] {market.slug}: {len(combined):,} rows → {path.name}")
+        results[market.slug] = True
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Commentary
+# ──────────────────────────────────────────────────────────────────────
 
 
 def fetch_commentary(url: str) -> dict:
@@ -198,97 +270,7 @@ def fetch_commentary(url: str) -> dict:
         return {"ok": False, "error": f"{e.__class__.__name__}: {str(e)[:120]}"}
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Build steps
-# ──────────────────────────────────────────────────────────────────────
-
-
-def build_zillow_all_markets() -> dict[str, bool]:
-    """Download Zillow ZHVI+ZORI once, filter for each market, write parquet per market."""
-    print("[zillow] downloading ZHVI + ZORI CSVs (once for all markets)...", flush=True)
-    raw: dict[str, pd.DataFrame] = {}
-    for url, kind in [(ZHVI_URL, "zhvi"), (ZORI_URL, "zori")]:
-        try:
-            raw[kind] = load_zillow_csv(url)
-            print(f"  [ok] {kind}: {len(raw[kind]):,} total county-rows")
-        except Exception as e:
-            print(f"  [fail] {kind}: {e.__class__.__name__}: {e}", file=sys.stderr)
-    if not raw:
-        return {m.slug: False for m in MARKETS}
-
-    results: dict[str, bool] = {}
-    for market in MARKETS:
-        try:
-            frames = []
-            for kind, wide in raw.items():
-                frames.append(melt_zillow(wide, market.counties, market.state, kind))
-            combined = pd.concat(frames, ignore_index=True)
-            path = DATA_DIR / f"{market.slug}-zillow.parquet"
-            combined.to_parquet(path, index=False, compression="zstd")
-            n_counties = combined["RegionName"].nunique()
-            print(f"  [ok] {market.slug}: {len(combined):,} rows × {n_counties} counties → {path.name}")
-            results[market.slug] = True
-        except Exception as e:
-            print(f"  [fail] {market.slug}: {e.__class__.__name__}: {e}", file=sys.stderr)
-            results[market.slug] = False
-    return results
-
-
-def build_fred_all_markets() -> dict[str, bool]:
-    """For each market, write per-market parquet with whatever FRED data we got.
-
-    Mortgage rate comes from Freddie Mac PMMS (more reliable than FRED's
-    fredgraph.csv endpoint). The rest are best-effort FRED CSV calls.
-    """
-    print("[fred] fetching series per market...", flush=True)
-
-    global_cache: dict[str, pd.DataFrame] = {}
-
-    # 1. Mortgage rate via PMMS (primary path)
-    try:
-        global_cache["MORTGAGE30US"] = fetch_pmms_mortgage()
-        print(f"  [ok] MORTGAGE30US via PMMS: {len(global_cache['MORTGAGE30US']):,} obs")
-    except Exception as e:
-        print(f"  [fail] PMMS mortgage: {e.__class__.__name__}: {e} — trying FRED", file=sys.stderr)
-        try:
-            global_cache["MORTGAGE30US"] = fetch_fred_series("MORTGAGE30US")
-            print(f"  [ok] MORTGAGE30US via FRED fallback: {len(global_cache['MORTGAGE30US']):,} obs")
-        except Exception as e2:
-            print(f"  [fail] MORTGAGE30US fallback: {e2.__class__.__name__}", file=sys.stderr)
-
-    # 2. Other global FRED series (FL state-level)
-    for sid in GLOBAL_FRED_SERIES:
-        if sid == "MORTGAGE30US":
-            continue  # handled above via PMMS
-        try:
-            global_cache[sid] = fetch_fred_series(sid)
-            print(f"  [ok] {sid} (global): {len(global_cache[sid]):,} obs")
-        except Exception as e:
-            print(f"  [fail] {sid} (global): {e.__class__.__name__}", file=sys.stderr)
-
-    # 3. Per-market MSA series
-    results: dict[str, bool] = {}
-    for market in MARKETS:
-        frames: list[pd.DataFrame] = list(global_cache.values())
-        for purpose, sid in market.fred_series.items():
-            try:
-                frames.append(fetch_fred_series(sid))
-                print(f"  [ok] {market.slug}/{purpose} ({sid}): added")
-            except Exception as e:
-                print(f"  [fail] {market.slug}/{purpose} ({sid}): {e.__class__.__name__}", file=sys.stderr)
-        if not frames:
-            results[market.slug] = False
-            continue
-        combined = pd.concat(frames, ignore_index=True)
-        path = DATA_DIR / f"{market.slug}-fred.parquet"
-        combined.to_parquet(path, index=False, compression="zstd")
-        print(f"  [ok] {market.slug}: {len(combined):,} rows → {path.name}")
-        results[market.slug] = True
-    return results
-
-
 def build_commentary() -> bool:
-    """Single commentary set, shared across markets."""
     print("[commentary] fetching sources in parallel...", flush=True)
     urls = [s["url"] for s in COMMENTARY_SOURCES]
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -308,13 +290,13 @@ def build_commentary() -> bool:
 def main() -> int:
     started = time.time()
     print(f"Building snapshot for {len(MARKETS)} markets in {DATA_DIR}")
-    zillow_results = build_zillow_all_markets()
-    fred_results = build_fred_all_markets()
+    zillow = build_zillow_all_markets()
+    indicators = build_indicators_all_markets()
     commentary_ok = build_commentary()
     elapsed = time.time() - started
-    total_ok = sum(zillow_results.values()) + sum(fred_results.values()) + (1 if commentary_ok else 0)
-    print(f"\nDone — Zillow {sum(zillow_results.values())}/{len(MARKETS)}, "
-          f"FRED {sum(fred_results.values())}/{len(MARKETS)}, "
+    total_ok = sum(zillow.values()) + sum(indicators.values()) + (1 if commentary_ok else 0)
+    print(f"\nDone — Zillow {sum(zillow.values())}/{len(MARKETS)}, "
+          f"Indicators {sum(indicators.values())}/{len(MARKETS)}, "
           f"Commentary {'ok' if commentary_ok else 'fail'}. "
           f"Elapsed: {elapsed:.1f}s")
     return 0 if total_ok > 0 else 1
