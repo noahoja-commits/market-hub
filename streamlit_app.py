@@ -6,14 +6,19 @@ from local Tampa Bay realtor/PM/research blogs. No API keys.
 
 from __future__ import annotations
 
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from io import StringIO
+from pathlib import Path
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+
+DATA_DIR = Path(__file__).parent / "data"
 
 st.set_page_config(
     page_title="Tampa Bay Market Hub",
@@ -105,12 +110,41 @@ def _empty_series() -> pd.DataFrame:
     return pd.DataFrame({"date": [], "value": []})
 
 
+def _zillow_from_snapshot(kind: str) -> pd.DataFrame | None:
+    """Read pre-baked Zillow snapshot for given kind ('zhvi' or 'zori')."""
+    path = DATA_DIR / "tampa-bay-zillow.parquet"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path)
+        df = df[df["kind"] == kind].drop(columns=["kind"]).reset_index(drop=True)
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def _fred_from_snapshot(series_id: str) -> pd.DataFrame | None:
+    path = DATA_DIR / "tampa-bay-fred.parquet"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path)
+        df = df[df["series"] == series_id].drop(columns=["series"]).reset_index(drop=True)
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=WEEK, show_spinner=False)
 def fetch_zillow(url: str) -> pd.DataFrame:
-    """Fetch a Zillow county CSV and return long-form for Tampa Bay only.
+    """Read pre-baked snapshot if available, else live-fetch.
 
     Returns empty DataFrame on failure so the page still renders.
     """
+    kind = "zhvi" if "zhvi" in url else "zori"
+    snap = _zillow_from_snapshot(kind)
+    if snap is not None:
+        return snap
     try:
         r = requests.get(url, headers=HEADERS, timeout=120)
         r.raise_for_status()
@@ -133,15 +167,18 @@ def fetch_zillow(url: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=DAY, show_spinner=False)
 def fetch_fred(series_id: str) -> pd.DataFrame:
-    """Fetch a FRED CSV series, normalize to date + value columns.
+    """Read pre-baked snapshot if available, else live-fetch.
 
     Returns empty DataFrame on failure so the page still renders.
     """
+    snap = _fred_from_snapshot(series_id)
+    if snap is not None:
+        return snap
     try:
         r = requests.get(
             FRED_TMPL.format(series_id=series_id),
             headers=HEADERS,
-            timeout=30,
+            timeout=10,
         )
         r.raise_for_status()
         df = pd.read_csv(StringIO(r.text))
@@ -200,14 +237,46 @@ def fetch_commentary(url: str) -> dict:
         return {"ok": False, "error": f"{e.__class__.__name__}: {str(e)[:80]}"}
 
 
+def _commentary_from_snapshot() -> dict[str, dict] | None:
+    path = DATA_DIR / "commentary.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload.get("sources") or None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=HOUR, show_spinner=False)
 def fetch_all_commentary(urls_key: tuple[str, ...]) -> dict[str, dict]:
-    """Fetch all commentary sources in parallel. Returns {url: result}."""
+    """Read pre-baked snapshot if available, else live-fetch in parallel."""
+    snap = _commentary_from_snapshot()
+    if snap is not None:
+        # Only return entries whose URLs are still in our source list
+        return {url: snap.get(url, {"ok": False, "error": "not in snapshot"}) for url in urls_key}
     out: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(fetch_commentary, urls_key))
     for url, res in zip(urls_key, results):
         out[url] = res
+    return out
+
+
+def snapshot_freshness() -> dict[str, str]:
+    """Return human-readable last-modified timestamps for each snapshot file."""
+    out: dict[str, str] = {}
+    for label, fname in [
+        ("Zillow", "tampa-bay-zillow.parquet"),
+        ("FRED", "tampa-bay-fred.parquet"),
+        ("Commentary", "commentary.json"),
+    ]:
+        path = DATA_DIR / fname
+        if path.exists():
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            out[label] = mtime.strftime("%Y-%m-%d %H:%M UTC")
+        else:
+            out[label] = "live"
     return out
 
 
@@ -258,15 +327,21 @@ st.title("Tampa Bay Market Hub")
 st.caption("Hillsborough · Pinellas · Pasco · Hernando")
 
 with st.sidebar:
-    st.header("Refresh")
+    st.header("Snapshot status")
+    freshness = snapshot_freshness()
+    for label, ts in freshness.items():
+        if ts == "live":
+            st.caption(f"**{label}:** live fetch (no snapshot)")
+        else:
+            st.caption(f"**{label}:** {ts}")
     st.caption(
-        "Data is cached locally — 1 week (Zillow), 1 day (FRED), 1 hour (commentary). "
-        "Click below to force a re-fetch of everything."
+        "Data is read from pre-baked snapshots committed to the repo. "
+        "Refreshed weekly by the GitHub Action. Pages should load in <1s."
     )
-    if st.button("Refresh all data now", use_container_width=True):
+    st.divider()
+    if st.button("Force live re-fetch", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-    st.divider()
     st.caption(
         "**Sources:** Zillow Research (ZHVI, ZORI), FRED (Federal Reserve), "
         "plus local realtor/PM blogs (see Commentary section)."
