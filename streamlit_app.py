@@ -480,36 +480,63 @@ with st.container(border=True):
     in_col, out_col = st.columns([1, 1.4])
     with in_col:
         county_short_to_full = {c.replace(" County", ""): c for c in market.counties}
+        short_names = list(county_short_to_full.keys())
+        # Read deal inputs from URL query params for shareable deal links
+        qp = st.query_params
+        qp_county = qp.get("county")
+        county_index = short_names.index(qp_county) if qp_county in short_names else 0
         sel_short = st.selectbox(
             "County",
-            list(county_short_to_full.keys()),
-            index=0,
+            short_names,
+            index=county_index,
+            key="deal_county",
         )
         sel_county = county_short_to_full[sel_short]
+        snapshot_value = int(zhvi_latest["value"].get(sel_county) or 350_000)
         deal_price = st.number_input(
             "Purchase price ($)",
             min_value=10_000, max_value=5_000_000,
-            value=int(zhvi_latest["value"].get(sel_county) or 350_000),
+            value=int(qp.get("price", snapshot_value)),
             step=5_000,
+            key="deal_price",
         )
         deal_repair = st.number_input(
             "Estimated repair cost ($)",
             min_value=0, max_value=1_000_000,
-            value=25_000, step=5_000,
+            value=int(qp.get("repair", 25_000)),
+            step=5_000,
+            key="deal_repair",
         )
         deal_arv = st.number_input(
             "ARV — after-repair value ($)",
             min_value=10_000, max_value=5_000_000,
-            value=int(deal_price * 1.20),
+            value=int(qp.get("arv", int(deal_price * 1.20))),
             step=5_000,
+            key="deal_arv",
         )
-        deal_down = st.slider("Down payment (%)", 0, 100, 20, step=5) / 100
+        deal_down_pct = st.slider(
+            "Down payment (%)", 0, 100,
+            int(qp.get("down", 20)),
+            step=5,
+            key="deal_down",
+        )
+        deal_down = deal_down_pct / 100
         deal_rate = st.slider(
             "Mortgage rate (%)",
             min_value=3.0, max_value=12.0,
-            value=float(last_mortgage) if last_mortgage is not None else 6.81,
+            value=float(qp.get("rate", last_mortgage if last_mortgage is not None else 6.81)),
             step=0.05,
+            key="deal_rate",
         )
+        # Persist current inputs into URL so it becomes shareable
+        st.query_params.update({
+            "county": sel_short,
+            "price": str(deal_price),
+            "repair": str(deal_repair),
+            "arv": str(deal_arv),
+            "down": str(deal_down_pct),
+            "rate": f"{deal_rate:.2f}",
+        })
     with out_col:
         county_rent = zori_latest["value"].get(sel_county)
         cr = cap_rate(deal_price, county_rent) if county_rent else None
