@@ -41,4 +41,14 @@ jobs:
             exit 0
           fi
           git commit -m "chore(data): weekly snapshot refresh [skip ci]"
-          git push
+          # Retry up to 3x with rebase to handle the race where someone
+          # pushes during the build.
+          for i in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push failed (attempt $i) — pulling --rebase and retrying"
+            git pull --rebase origin main
+          done
+          echo "Push failed after 3 attempts"
+          exit 1
