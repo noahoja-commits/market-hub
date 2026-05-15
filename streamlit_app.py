@@ -630,6 +630,30 @@ with st.container(border=True):
             delta_color=("inverse" if brrrr and brrrr.left_in > 0 else "normal"),
         )
 
+        # Historical cap-rate trend for the selected county — useful for
+        # "is this county becoming more attractive over time" thinking.
+        county_zhvi = zhvi[zhvi["RegionName"] == sel_county][["date", "value"]].rename(
+            columns={"value": "value_zhvi"}
+        )
+        county_zori = zori[zori["RegionName"] == sel_county][["date", "value"]].rename(
+            columns={"value": "value_zori"}
+        )
+        if not county_zhvi.empty and not county_zori.empty:
+            joined = county_zhvi.merge(county_zori, on="date", how="inner")
+            if not joined.empty:
+                joined["cap_rate_pct"] = (
+                    joined["value_zori"] * 12 / joined["value_zhvi"] * 100
+                )
+                tail = joined.tail(60)[["date", "cap_rate_pct"]].rename(
+                    columns={"cap_rate_pct": f"{sel_short} cap %"}
+                )
+                st.caption(f"Historical gross cap rate — {sel_short} (60 months)")
+                st.line_chart(
+                    tail.set_index("date"),
+                    height=160,
+                    color="#22c55e",
+                )
+
 st.subheader("By county")
 st.caption("Gross cap rate uses Zillow ZORI median rent ÷ ZHVI median value, annualized. Best cap rate in this metro gets a ⭐.")
 county_cap_rates: dict[str, float] = {}
